@@ -1,19 +1,54 @@
 // API base URL - assumes API is served on same host
 const API_BASE = window.location.origin;
 
+// Per-tracker palettes. Each spans multiple hues so intensity is readable
+// within a single cat's heatmap. Combined with mix-blend-mode: screen on the
+// heat-layer canvases, overlap zones mix toward white.
+const HEATMAP_PALETTES = [
+    // Cool: deep blue → cyan-blue → mint-cyan → pale cyan
+    { 0.0: '#0040c0', 0.4: '#00b4ff', 0.7: '#40ffc0', 1.0: '#e0ffff' },
+    // Warm: dark red → orange-red → orange → yellow (mirrors classic heat gradient)
+    { 0.0: '#c01818', 0.4: '#ff4818', 0.7: '#ffa020', 1.0: '#ffe830' }
+];
+
 // State
 let map = null;
-let heatLayer = null;
-let latestMarker = null;
+let heatLayers = {};         // trackerId -> L.heatLayer
+let latestMarkers = {};      // trackerId -> L.marker
 let allTrackers = [];
-let currentTracker = null;
 let currentDateRange = { days: 7 };
-let currentPositions = [];
+let positionsByTracker = {}; // trackerId -> positions[]
 let heatMapSettings = {
     intensity: 0.3,
     radius: 25,
     blur: 15
 };
+
+function paletteForIndex(idx) {
+    return HEATMAP_PALETTES[idx % HEATMAP_PALETTES.length];
+}
+
+function paletteSwatch(palette) {
+    // Pick a mid-to-high stop so the swatch matches what the heatmap actually shows
+    const stops = Object.keys(palette).map(Number).sort((a, b) => a - b);
+    const mid = stops[Math.floor(stops.length * 0.7)] ?? stops[stops.length - 1];
+    return palette[mid] ?? '#888';
+}
+
+function makePinIcon(color) {
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="26" height="38" viewBox="0 0 26 38">
+        <path d="M13 0C5.8 0 0 5.8 0 13c0 9.75 13 25 13 25s13-15.25 13-25C26 5.8 20.2 0 13 0z"
+              fill="${color}" stroke="#222" stroke-width="1.5"/>
+        <circle cx="13" cy="13" r="5" fill="#fff"/>
+    </svg>`;
+    return L.divIcon({
+        html: svg,
+        className: 'cat-pin-icon',
+        iconSize: [26, 38],
+        iconAnchor: [13, 38],
+        popupAnchor: [0, -34]
+    });
+}
 
 // Initialize date inputs with defaults
 function initializeDateInputs() {
@@ -64,12 +99,28 @@ function showError(message) {
     }, 5000);
 }
 
-// Update statistics panel
-function updateStats(tracker, positions) {
-    const range = getDateRange();
+function sortedTrackerIds() {
+    return Object.keys(positionsByTracker).map(Number).sort((a, b) => a - b);
+}
 
-    document.getElementById('stat-tracker').textContent = tracker ? tracker.name : '-';
-    document.getElementById('stat-count').textContent = positions ? positions.length : '-';
+// Update statistics panel
+function updateStats() {
+    const range = getDateRange();
+    const ids = sortedTrackerIds();
+
+    let total = 0;
+    let latestOverall = null;
+
+    ids.forEach(id => {
+        const positions = positionsByTracker[id] || [];
+        total += positions.length;
+        if (positions.length > 0) {
+            const t = new Date(positions[0].timestamp);
+            if (!latestOverall || t > latestOverall) latestOverall = t;
+        }
+    });
+
+    document.getElementById('stat-count').textContent = total || '-';
 
     if (range.start && range.end) {
         const startStr = range.start.toLocaleDateString();
@@ -77,15 +128,7 @@ function updateStats(tracker, positions) {
         document.getElementById('stat-range').textContent = `${startStr} - ${endStr}`;
     }
 
-    if (positions && positions.length > 0) {
-        const latest = positions[0];
-        const latestDate = new Date(latest.timestamp);
-        document.getElementById('stat-latest').textContent = latestDate.toLocaleString();
-        document.getElementById('stat-battery').textContent = `${latest.battery}%`;
-    } else {
-        document.getElementById('stat-latest').textContent = '-';
-        document.getElementById('stat-battery').textContent = '-';
-    }
+    document.getElementById('stat-latest').textContent = latestOverall ? latestOverall.toLocaleString() : '-';
 }
 
 // Fetch trackers from API
@@ -105,68 +148,61 @@ async function fetchTrackers() {
 
 // Fetch positions for a tracker
 async function fetchPositions(trackerID, start, end) {
-    try {
-        const params = new URLSearchParams({
-            start: start.toISOString(),
-            end: end.toISOString()
-        });
+    const params = new URLSearchParams({
+        start: start.toISOString(),
+        end: end.toISOString()
+    });
 
-        const response = await fetch(`${API_BASE}/api/positions/${trackerID}?${params}`);
-        if (!response.ok) {
-            if (response.status === 404) {
-                throw new Error(`Tracker ${trackerID} not found`);
-            } else if (response.status === 400) {
-                throw new Error('Invalid date format');
-            }
-            throw new Error(`Failed to fetch positions: ${response.statusText}`);
+    const response = await fetch(`${API_BASE}/api/positions/${trackerID}?${params}`);
+    if (!response.ok) {
+        if (response.status === 404) {
+            throw new Error(`Tracker ${trackerID} not found`);
+        } else if (response.status === 400) {
+            throw new Error('Invalid date format');
         }
-        const data = await response.json();
-        return data.positions || [];
-    } catch (error) {
-        console.error('Error fetching positions:', error);
-        throw error;
+        throw new Error(`Failed to fetch positions: ${response.statusText}`);
     }
+    const data = await response.json();
+    return data.positions || [];
 }
 
-// Populate tracker selector
-function populateTrackerSelect(trackers) {
-    const select = document.getElementById('tracker-select');
-    select.innerHTML = '';
+// Populate tracker legend (color swatch + name)
+function populateTrackerLegend(trackers) {
+    const legend = document.getElementById('tracker-legend');
+    legend.innerHTML = '';
 
     if (trackers.length === 0) {
-        select.innerHTML = '<option value="">No trackers found</option>';
+        legend.innerHTML = '<div class="tracker-legend-item">No trackers found</div>';
         return;
     }
 
-    trackers.forEach(tracker => {
-        const option = document.createElement('option');
-        option.value = tracker.id;
-        option.textContent = `${tracker.name} (${tracker.position_count} positions)`;
-        select.appendChild(option);
+    const sorted = [...trackers].sort((a, b) => a.id - b.id);
+    sorted.forEach((tracker, idx) => {
+        const swatch = paletteSwatch(paletteForIndex(idx));
+        const item = document.createElement('div');
+        item.className = 'tracker-legend-item';
+        item.innerHTML = `
+            <span class="tracker-legend-swatch" style="background: ${swatch}"></span>
+            ${tracker.name}
+        `;
+        legend.appendChild(item);
     });
-
-    // Select first tracker by default
-    if (trackers.length > 0) {
-        select.value = trackers[0].id;
-    }
 }
 
 // Initialize the map
 function initMap(center = [59.9139, 10.7522], zoom = 13) {
     if (map) {
-        return; // Already initialized
+        return;
     }
 
     map = L.map('map').setView(center, zoom);
 
-    // Add OpenStreetMap tile layer
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
         attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
         maxZoom: 19
     }).addTo(map);
 }
 
-// Calculate center point from positions
 function calculateCenter(positions) {
     if (positions.length === 0) {
         return null;
@@ -183,69 +219,61 @@ function calculateCenter(positions) {
     return [sumLat / positions.length, sumLng / positions.length];
 }
 
-// Render heat map from positions
-function renderHeatMap(positions, resetView = true) {
-    // Remove existing heat layer if present
-    if (heatLayer) {
-        map.removeLayer(heatLayer);
-        heatLayer = null;
-    }
+// Render one heat layer per tracker, each with its assigned palette
+function renderHeatMaps(resetView = true) {
+    Object.values(heatLayers).forEach(layer => map.removeLayer(layer));
+    heatLayers = {};
+    Object.values(latestMarkers).forEach(marker => map.removeLayer(marker));
+    latestMarkers = {};
 
-    // Remove existing marker if present
-    if (latestMarker) {
-        map.removeLayer(latestMarker);
-        latestMarker = null;
-    }
+    const ids = sortedTrackerIds();
+    let allPositions = [];
 
-    if (positions.length === 0) {
-        showError('No positions found for this tracker in the selected date range');
-        return;
-    }
+    ids.forEach((id, idx) => {
+        const positions = positionsByTracker[id] || [];
+        if (positions.length === 0) return;
 
-    // Convert positions to heat map format [lat, lng, intensity]
-    const heatData = positions.map(pos => [pos.lat, pos.lng, heatMapSettings.intensity]);
+        const palette = paletteForIndex(idx);
+        const heatData = positions.map(pos => [pos.lat, pos.lng, heatMapSettings.intensity]);
 
-    // Create heat layer with custom options
-    heatLayer = L.heatLayer(heatData, {
-        radius: heatMapSettings.radius,
-        blur: heatMapSettings.blur,
-        maxZoom: 17,
-        max: 3.0,  // Increased from 1.0 to allow more dynamic range
-        gradient: {
-            0.0: 'blue',
-            0.5: 'lime',
-            0.7: 'yellow',
-            1.0: 'red'
-        }
-    }).addTo(map);
+        heatLayers[id] = L.heatLayer(heatData, {
+            radius: heatMapSettings.radius,
+            blur: heatMapSettings.blur,
+            maxZoom: 17,
+            max: 3.0,
+            gradient: palette
+        }).addTo(map);
 
-    // Only reset view when loading new data, not when adjusting settings
-    if (resetView) {
-        const center = calculateCenter(positions);
+        const tracker = allTrackers.find(t => t.id === id);
+        const latest = positions[0];
+        const latestDate = new Date(latest.timestamp);
+        const swatch = paletteSwatch(palette);
+        latestMarkers[id] = L.marker([latest.lat, latest.lng], { icon: makePinIcon(swatch) })
+            .addTo(map)
+            .bindPopup(`
+                <strong>${tracker ? tracker.name : 'Tracker ' + id}</strong><br>
+                Time: ${latestDate.toLocaleString()}<br>
+                Battery: ${latest.battery}%
+            `);
+
+        allPositions = allPositions.concat(positions);
+    });
+
+    if (resetView && allPositions.length > 0) {
+        const center = calculateCenter(allPositions);
         if (center) {
             map.setView(center, 13);
         }
     }
 
-    // Add a marker for the most recent position
-    if (positions.length > 0) {
-        const latest = positions[0];
-        const latestDate = new Date(latest.timestamp);
-
-        latestMarker = L.marker([latest.lat, latest.lng])
-            .addTo(map)
-            .bindPopup(`
-                <strong>Latest Position</strong><br>
-                Time: ${latestDate.toLocaleString()}<br>
-                Battery: ${latest.battery}%
-            `)
-            .openPopup();
+    if (allPositions.length === 0) {
+        showError('No positions found for any tracker in the selected date range');
     }
 }
 
-// Load and display tracker data
-async function loadTrackerData() {
-    if (!currentTracker) {
+// Load and display data for all trackers in parallel
+async function loadAllTrackerData() {
+    if (allTrackers.length === 0) {
         return;
     }
 
@@ -253,27 +281,31 @@ async function loadTrackerData() {
         setLoading(true);
 
         const range = getDateRange();
-        console.log(`Loading positions for tracker ${currentTracker.name} from ${range.start} to ${range.end}`);
+        console.log(`Loading positions for ${allTrackers.length} tracker(s) from ${range.start} to ${range.end}`);
 
-        const positions = await fetchPositions(currentTracker.id, range.start, range.end);
-        console.log(`Loaded ${positions.length} positions`);
+        const results = await Promise.all(
+            allTrackers.map(t =>
+                fetchPositions(t.id, range.start, range.end)
+                    .then(positions => ({ id: t.id, positions }))
+                    .catch(err => {
+                        console.error(`Failed to load tracker ${t.id}:`, err);
+                        return { id: t.id, positions: [] };
+                    })
+            )
+        );
 
-        // Store positions in state
-        currentPositions = positions;
+        positionsByTracker = {};
+        results.forEach(({ id, positions }) => {
+            positionsByTracker[id] = positions;
+        });
 
-        // Check if this is first load (map doesn't exist yet)
         const isFirstLoad = !map;
-
-        // Initialize map if needed
         if (isFirstLoad) {
             initMap();
         }
 
-        // Render heat map (reset view only on first load)
-        renderHeatMap(positions, isFirstLoad);
-
-        // Update stats
-        updateStats(currentTracker, positions);
+        renderHeatMaps(isFirstLoad);
+        updateStats();
 
         setLoading(false);
     } catch (error) {
@@ -285,80 +317,54 @@ async function loadTrackerData() {
 
 // Setup event listeners
 function setupEventListeners() {
-    // Tracker selection
-    document.getElementById('tracker-select').addEventListener('change', (e) => {
-        const trackerId = parseInt(e.target.value);
-        currentTracker = allTrackers.find(t => t.id === trackerId);
-        loadTrackerData();
-    });
-
     // Date range preset buttons
     document.querySelectorAll('.date-presets .btn').forEach(btn => {
         btn.addEventListener('click', () => {
-            // Update active state
             document.querySelectorAll('.date-presets .btn').forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
 
             const days = btn.dataset.days;
 
             if (days === 'custom') {
-                // Show custom date inputs
                 document.getElementById('custom-dates').style.display = 'flex';
                 currentDateRange = { custom: true };
             } else {
-                // Hide custom date inputs
                 document.getElementById('custom-dates').style.display = 'none';
                 currentDateRange = { days: parseInt(days) };
-                loadTrackerData();
+                loadAllTrackerData();
             }
         });
     });
 
-    // Custom date inputs
     document.getElementById('start-date').addEventListener('change', () => {
         if (currentDateRange.custom) {
-            loadTrackerData();
+            loadAllTrackerData();
         }
     });
 
     document.getElementById('end-date').addEventListener('change', () => {
         if (currentDateRange.custom) {
-            loadTrackerData();
+            loadAllTrackerData();
         }
     });
 
-    // Heat map setting sliders
+    // Heat map setting sliders — re-render with cached positions, no refetch
     document.getElementById('intensity-slider').addEventListener('input', (e) => {
-        const value = parseFloat(e.target.value);
-        heatMapSettings.intensity = value;
-        document.getElementById('intensity-value').textContent = value.toFixed(2);
-
-        // Re-render heat map with new settings, but don't reset view
-        if (currentPositions.length > 0) {
-            renderHeatMap(currentPositions, false);
-        }
+        heatMapSettings.intensity = parseFloat(e.target.value);
+        document.getElementById('intensity-value').textContent = heatMapSettings.intensity.toFixed(2);
+        renderHeatMaps(false);
     });
 
     document.getElementById('radius-slider').addEventListener('input', (e) => {
-        const value = parseInt(e.target.value);
-        heatMapSettings.radius = value;
-        document.getElementById('radius-value').textContent = value;
-
-        // Re-render heat map with new settings, but don't reset view
-        if (currentPositions.length > 0) {
-            renderHeatMap(currentPositions, false);
-        }
+        heatMapSettings.radius = parseInt(e.target.value);
+        document.getElementById('radius-value').textContent = heatMapSettings.radius;
+        renderHeatMaps(false);
     });
 
     document.getElementById('blur-slider').addEventListener('input', (e) => {
-        const value = parseInt(e.target.value);
-        heatMapSettings.blur = value;
-        document.getElementById('blur-value').textContent = value;
-
-        // Re-render heat map with new settings, but don't reset view
-        if (currentPositions.length > 0) {
-            renderHeatMap(currentPositions, false);
-        }
+        heatMapSettings.blur = parseInt(e.target.value);
+        document.getElementById('blur-value').textContent = heatMapSettings.blur;
+        renderHeatMaps(false);
     });
 }
 
@@ -367,13 +373,9 @@ async function init() {
     try {
         setLoading(true);
 
-        // Initialize date inputs
         initializeDateInputs();
-
-        // Setup event listeners
         setupEventListeners();
 
-        // Fetch all trackers
         allTrackers = await fetchTrackers();
 
         if (!allTrackers || allTrackers.length === 0) {
@@ -382,21 +384,15 @@ async function init() {
 
         console.log(`Found ${allTrackers.length} tracker(s)`);
 
-        // Populate tracker selector
-        populateTrackerSelect(allTrackers);
+        populateTrackerLegend(allTrackers);
 
-        // Set current tracker to first one
-        currentTracker = allTrackers[0];
-
-        // Load initial data
-        await loadTrackerData();
+        await loadAllTrackerData();
 
     } catch (error) {
         console.error('Error initializing app:', error);
         setLoading(false);
         showError(error.message);
 
-        // Initialize empty map anyway so user sees something
         if (!map) {
             initMap();
         }

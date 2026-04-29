@@ -535,14 +535,37 @@
 		const HEATMAP_CACHE_KEY = 'cat2k_heatmap_cache';
 		const HEATMAP_CACHE_DURATION = 24 * 60 * 60 * 1000; // 24 hours in ms
 
-		// Parse hex color to RGB
-		function hexToRgbComponents(hex) {
-			const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
-			return result ? {
-				r: parseInt(result[1], 16),
-				g: parseInt(result[2], 16),
-				b: parseInt(result[3], 16)
-			} : { r: 255, g: 255, b: 255 };
+		// Complementary palettes — additive blending of these mixes toward white
+		// in overlap zones, making shared territory visually obvious.
+		const HEATMAP_PALETTES = [
+			[
+				{ stop: 0.0, r: 30,  g: 80,  b: 200 },
+				{ stop: 0.5, r: 60,  g: 180, b: 255 },
+				{ stop: 1.0, r: 180, g: 240, b: 255 }
+			],
+			[
+				{ stop: 0.0, r: 200, g: 40,  b: 80 },
+				{ stop: 0.5, r: 255, g: 120, b: 60 },
+				{ stop: 1.0, r: 255, g: 230, b: 120 }
+			]
+		];
+
+		function paletteColor(palette, t) {
+			for (let i = 0; i < palette.length - 1; i++) {
+				if (t <= palette[i + 1].stop) {
+					const a = palette[i];
+					const b = palette[i + 1];
+					const span = b.stop - a.stop;
+					const localT = span === 0 ? 0 : (t - a.stop) / span;
+					return {
+						r: Math.round(a.r + (b.r - a.r) * localT),
+						g: Math.round(a.g + (b.g - a.g) * localT),
+						b: Math.round(a.b + (b.b - a.b) * localT)
+					};
+				}
+			}
+			const last = palette[palette.length - 1];
+			return { r: last.r, g: last.g, b: last.b };
 		}
 
 		// Initialize and render heatmap
@@ -635,20 +658,21 @@
 			// Heavy blur for soft, ambient glow effect
 			ctx.filter = 'blur(12px)';
 
-			// Render each tracker's heatmap - very subtle
-			for (const [trackerId, trackerData] of Object.entries(data.trackers)) {
-				const rgb = hexToRgbComponents(trackerData.color);
+			// Numeric sort so palette assignment is stable regardless of ID digit-count
+			const sortedTrackerIds = Object.keys(data.trackers).sort((a, b) => Number(a) - Number(b));
+			const logMax = Math.log(globalMax + 1);
+
+			sortedTrackerIds.forEach((trackerId, idx) => {
+				const trackerData = data.trackers[trackerId];
+				const palette = HEATMAP_PALETTES[idx % HEATMAP_PALETTES.length];
 
 				for (const bin of trackerData.bins) {
-					// Normalize count using log scale
-					const logCount = Math.log(bin.count + 1);
-					const logMax = Math.log(globalMax + 1);
-					const intensity = logCount / logMax;
+					const intensity = Math.log(bin.count + 1) / logMax;
 
-					// Very low alpha for subtle ambient effect (0.02 to 0.15)
+					const color = paletteColor(palette, intensity);
 					const alpha = 0.02 + intensity * 0.13;
 
-					ctx.fillStyle = `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${alpha})`;
+					ctx.fillStyle = `rgba(${color.r}, ${color.g}, ${color.b}, ${alpha})`;
 
 					const x = bin.x * binSize + binSize / 2;
 					const y = bin.y * binSize + binSize / 2;
@@ -658,7 +682,7 @@
 					ctx.arc(x, y, radius, 0, Math.PI * 2);
 					ctx.fill();
 				}
-			}
+			});
 
 			// Reset
 			ctx.filter = 'none';

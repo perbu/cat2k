@@ -203,6 +203,32 @@
             font-size: 0.9rem;
         }
 
+        .tracker-legend-item {
+            display: flex;
+            align-items: center;
+            padding: 0.4rem 0;
+            font-size: 0.9rem;
+            color: #2c3e50;
+        }
+
+        .tracker-legend-swatch {
+            width: 14px;
+            height: 14px;
+            border-radius: 3px;
+            margin-right: 0.6rem;
+            flex-shrink: 0;
+        }
+
+        /* Additive blending so overlapping heatmaps mix toward white in shared territory */
+        .leaflet-heatmap-layer {
+            mix-blend-mode: screen;
+        }
+
+        .cat-pin-icon {
+            background: transparent;
+            border: none;
+        }
+
         #loading {
             position: absolute;
             top: 50%;
@@ -285,10 +311,8 @@
     <div id="container">
         <div id="sidebar">
             <div class="control-group">
-                <label for="tracker-select">Select Tracker</label>
-                <select id="tracker-select">
-                    <option value="">Loading...</option>
-                </select>
+                <label>Trackers</label>
+                <div id="tracker-legend"></div>
             </div>
 
             <div class="control-group">
@@ -334,10 +358,6 @@
                 <label>Statistics</label>
                 <div id="stats-panel">
                     <div class="stat-row">
-                        <span class="stat-label">Tracker</span>
-                        <span class="stat-value" id="stat-tracker">-</span>
-                    </div>
-                    <div class="stat-row">
                         <span class="stat-label">Total Positions</span>
                         <span class="stat-value" id="stat-count">-</span>
                     </div>
@@ -348,10 +368,6 @@
                     <div class="stat-row">
                         <span class="stat-label">Latest Update</span>
                         <span class="stat-value" id="stat-latest">-</span>
-                    </div>
-                    <div class="stat-row">
-                        <span class="stat-label">Battery</span>
-                        <span class="stat-value" id="stat-battery">-</span>
                     </div>
                 </div>
             </div>
