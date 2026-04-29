@@ -1,0 +1,23 @@
+services:
+  cat2k:
+    build: .
+    container_name: cat2k
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # Database persistence
+      - ./data:/data
+      # Configuration file
+      - ./config.json:/app/config.json:ro
+    environment:
+      # Database path for persistence
+      - WEENECT_DATABASE_PATH=/data/catboard.db
+      # Optional: set timezone
+      - TZ=Europe/Oslo
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

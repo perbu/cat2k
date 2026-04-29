@@ -1,3 +1,7 @@
 .idea
 .vscode
 .env
+data/
+config.json
+*.db
+bin/

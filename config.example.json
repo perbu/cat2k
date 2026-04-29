@@ -4,10 +4,16 @@
   "database_path": "./catboard.db",
   "rate_limit": 4.0,
   "backfill_start_date": "2024-01-01",
-  "sync_schedule": "0 2 * * *",
+  "sync_schedule": "*/5 * * * *",
   "log_level": "info",
   "http_listen": ":8080",
   "http_enabled": true,
   "home_lat": 59.9139,
-  "home_lon": 10.7522
+  "home_lon": 10.7522,
+  "surehub_email": "your-surehub-email",
+  "surehub_password": "your-surehub-password",
+  "heatmap_days": 60,
+  "pois": [
+    {"name": "Example Place", "lat": 59.9200, "lon": 10.7500, "color": "#888"}
+  ]
 }
