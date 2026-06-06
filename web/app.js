@@ -28,6 +28,16 @@ function paletteForIndex(idx) {
     return HEATMAP_PALETTES[idx % HEATMAP_PALETTES.length];
 }
 
+// Palette index for a tracker, keyed on the full id-sorted roster. Single source
+// of truth so the same cat gets the same color in the legend, activity panel,
+// and map — even when a tracker has no positions in the current range (in which
+// case the map skips it, but its color slot must not shift).
+function trackerPaletteIndex(id) {
+    const ids = allTrackers.map(t => t.id).sort((a, b) => a - b);
+    const i = ids.indexOf(id);
+    return i < 0 ? 0 : i;
+}
+
 function paletteSwatch(palette) {
     // Pick a mid-to-high stop so the swatch matches what the heatmap actually shows
     const stops = Object.keys(palette).map(Number).sort((a, b) => a - b);
@@ -177,8 +187,8 @@ function populateTrackerLegend(trackers) {
     }
 
     const sorted = [...trackers].sort((a, b) => a.id - b.id);
-    sorted.forEach((tracker, idx) => {
-        const swatch = paletteSwatch(paletteForIndex(idx));
+    sorted.forEach((tracker) => {
+        const swatch = paletteSwatch(paletteForIndex(trackerPaletteIndex(tracker.id)));
         const item = document.createElement('div');
         item.className = 'tracker-legend-item';
         item.innerHTML = `
@@ -187,6 +197,138 @@ function populateTrackerLegend(trackers) {
         `;
         legend.appendChild(item);
     });
+}
+
+// Format a distance in metres for display.
+function formatDistance(m) {
+    if (m >= 1000) return `${(m / 1000).toFixed(1)} km`;
+    return `${Math.round(m)} m`;
+}
+
+// Fetch per-cat activity summary
+async function fetchActivity(days = 4) {
+    const response = await fetch(`${API_BASE}/api/activity?days=${days}`);
+    if (!response.ok) {
+        throw new Error(`Failed to fetch activity: ${response.statusText}`);
+    }
+    return response.json();
+}
+
+// Render the per-cat activity panel. Colors match the tracker legend on this
+// page: swatch by palette, indexed in id-sorted order.
+function renderActivity(data) {
+    const panel = document.getElementById('activity-panel');
+    panel.innerHTML = '';
+
+    const trackers = [...(data.trackers || [])].sort((a, b) => a.id - b.id);
+    if (trackers.length === 0) {
+        panel.innerHTML = '<div class="activity-empty">No activity data</div>';
+        return;
+    }
+
+    const caption = document.createElement('div');
+    caption.className = 'activity-caption';
+    caption.textContent = 'Distance travelled per day';
+    panel.appendChild(caption);
+
+    const dayLabel = (date) => new Date(date + 'T00:00:00')
+        .toLocaleDateString(undefined, { weekday: 'short' });
+
+    trackers.forEach((tracker) => {
+        const color = paletteSwatch(paletteForIndex(trackerPaletteIndex(tracker.id)));
+        const days = tracker.days || [];
+        const today = days[days.length - 1];
+        const maxDist = Math.max(1, ...days.map(d => d.distance_m));
+
+        const bars = days.map((d, i) => {
+            const isToday = i === days.length - 1;
+            const pct = Math.round((d.distance_m / maxDist) * 100);
+            // Day stats are carried on the element for the hover popup.
+            const data = `data-name="${tracker.name}" data-date="${d.date}"`
+                + ` data-dist="${d.distance_m}" data-range="${d.range_m}"`
+                + ` data-active="${d.active_fraction}" data-fixes="${d.fixes}"`;
+            return `<div class="activity-bar ${isToday ? 'today' : ''}" ${data}>
+                <div class="activity-bar-fill" style="height: ${pct}%; background: ${color}"></div>
+            </div>`;
+        }).join('');
+
+        const labels = days.map((d, i) => {
+            const isToday = i === days.length - 1;
+            const text = isToday ? 'today' : dayLabel(d.date);
+            return `<div class="activity-daylabel ${isToday ? 'today' : ''}">${text}</div>`;
+        }).join('');
+
+        const todayDist = today ? formatDistance(today.distance_m) : '–';
+
+        const cat = document.createElement('div');
+        cat.className = 'activity-cat';
+        cat.innerHTML = `
+            <div class="activity-head">
+                <span class="tracker-legend-swatch" style="background: ${color}"></span>
+                <span class="activity-name">${tracker.name}</span>
+                <span class="activity-today">${todayDist} <small>today</small></span>
+            </div>
+            <div class="activity-bars">${bars}</div>
+            <div class="activity-labels">${labels}</div>
+        `;
+        panel.appendChild(cat);
+    });
+
+    attachActivityTooltip(panel);
+}
+
+// Single floating popup, shared by all bars, shown on hover.
+function attachActivityTooltip(panel) {
+    let tip = document.getElementById('activity-tooltip');
+    if (!tip) {
+        tip = document.createElement('div');
+        tip.id = 'activity-tooltip';
+        document.body.appendChild(tip);
+    }
+
+    const fmtDate = (date) => new Date(date + 'T00:00:00')
+        .toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' });
+
+    const show = (bar, x, y) => {
+        const d = bar.dataset;
+        tip.innerHTML = `
+            <div class="tip-head">${d.name} · ${fmtDate(d.date)}</div>
+            <div class="tip-row"><span>Distance</span><b>${formatDistance(+d.dist)}</b></div>
+            <div class="tip-row"><span>Range</span><b>${formatDistance(+d.range)}</b></div>
+            <div class="tip-row"><span>Active</span><b>${Math.round(d.active * 100)}%</b></div>
+            <div class="tip-row"><span>Fixes</span><b>${d.fixes}</b></div>
+        `;
+        tip.classList.add('show');
+        // Position above-right of the cursor, clamped to the viewport.
+        const r = tip.getBoundingClientRect();
+        let left = x + 14;
+        let top = y - r.height - 10;
+        if (left + r.width > window.innerWidth - 8) left = x - r.width - 14;
+        if (top < 8) top = y + 16;
+        tip.style.left = `${left}px`;
+        tip.style.top = `${top}px`;
+    };
+
+    const hide = () => tip.classList.remove('show');
+
+    panel.addEventListener('mousemove', (e) => {
+        const bar = e.target.closest('.activity-bar');
+        if (bar) show(bar, e.clientX, e.clientY);
+        else hide();
+    });
+    panel.addEventListener('mouseleave', hide);
+}
+
+// Load and render activity, swallowing errors (it's a secondary panel)
+async function loadActivity() {
+    try {
+        const data = await fetchActivity(7);
+        renderActivity(data);
+    } catch (err) {
+        console.error('Error loading activity:', err);
+        document.getElementById('activity-panel').innerHTML =
+            '<div class="activity-empty">Activity unavailable</div>';
+    }
 }
 
 // Initialize the map
@@ -229,11 +371,11 @@ function renderHeatMaps(resetView = true) {
     const ids = sortedTrackerIds();
     let allPositions = [];
 
-    ids.forEach((id, idx) => {
+    ids.forEach((id) => {
         const positions = positionsByTracker[id] || [];
         if (positions.length === 0) return;
 
-        const palette = paletteForIndex(idx);
+        const palette = paletteForIndex(trackerPaletteIndex(id));
         const heatData = positions.map(pos => [pos.lat, pos.lng, heatMapSettings.intensity]);
 
         heatLayers[id] = L.heatLayer(heatData, {
@@ -385,6 +527,7 @@ async function init() {
         console.log(`Found ${allTrackers.length} tracker(s)`);
 
         populateTrackerLegend(allTrackers);
+        loadActivity();
 
         await loadAllTrackerData();
 

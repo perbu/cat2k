@@ -48,6 +48,7 @@ func NewAPIServer(db *Database, cfg *Config, listenAddr string, logger *slog.Log
 	mux.HandleFunc("/api/positions/", api.handleGetPositions)
 	mux.HandleFunc("/api/status", api.handleGetStatus)
 	mux.HandleFunc("/api/heatmap", api.handleGetHeatmap)
+	mux.HandleFunc("/api/activity", api.handleGetActivity)
 	mux.HandleFunc("/health", api.handleHealth)
 
 	// Static file serving for web UI
@@ -422,6 +423,85 @@ func (a *APIServer) fetchPetStatus() map[string]petFlapStatus {
 
 	a.logger.Debug("Fetched pet status from SureHub", "pets", len(result))
 	return result
+}
+
+// ActivityTracker holds per-day activity metrics for one tracker.
+type ActivityTracker struct {
+	ID   int           `json:"id"`
+	Name string        `json:"name"`
+	Days []DayActivity `json:"days"` // oldest first
+}
+
+// ActivityResponse represents the /api/activity response.
+type ActivityResponse struct {
+	Days     int               `json:"days"`
+	Trackers []ActivityTracker `json:"trackers"`
+}
+
+// handleGetActivity handles GET /api/activity - per-cat daily activity summary.
+func (a *APIServer) handleGetActivity(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		a.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	days := 7
+	if daysStr := r.URL.Query().Get("days"); daysStr != "" {
+		if d, err := strconv.Atoi(daysStr); err == nil && d >= 1 && d <= 30 {
+			days = d
+		}
+	}
+
+	// Active-floor in metres: a hop must clear this to count as "active" for the
+	// active-fraction metric. Distance ignores it (always counts every hop).
+	// Tunable so the threshold can be swept without a rebuild.
+	activeFloorM := 20.0
+	if floorStr := r.URL.Query().Get("active_floor"); floorStr != "" {
+		if f, err := strconv.ParseFloat(floorStr, 64); err == nil && f >= 0 && f <= 1000 {
+			activeFloorM = f
+		}
+	}
+
+	loc, err := a.cfg.ActivityLocation()
+	if err != nil {
+		// Validated at startup, so this is unexpected; log and fall back.
+		a.logger.Warn("Falling back to server timezone for activity", "error", err)
+	}
+
+	// Build the list of calendar days, oldest first, ending today.
+	today := time.Now().In(loc)
+	startOfToday := time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, loc)
+	start := startOfToday.AddDate(0, 0, -(days - 1))
+
+	dates := make([]string, days)
+	for i := 0; i < days; i++ {
+		dates[i] = start.AddDate(0, 0, i).Format("2006-01-02")
+	}
+
+	positionsByTracker, err := a.db.GetPositionsForActivity(start)
+	if err != nil {
+		a.logger.Error("Failed to get positions for activity", "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Failed to retrieve positions")
+		return
+	}
+
+	trackers, err := a.db.GetAllTrackers()
+	if err != nil {
+		a.logger.Error("Failed to get trackers", "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Failed to retrieve trackers")
+		return
+	}
+
+	resp := ActivityResponse{Days: days, Trackers: []ActivityTracker{}}
+	for _, t := range trackers {
+		resp.Trackers = append(resp.Trackers, ActivityTracker{
+			ID:   t.ID,
+			Name: t.Name,
+			Days: computeActivity(positionsByTracker[t.ID], dates, a.cfg.HomeLat, a.cfg.HomeLon, activeFloorM, loc),
+		})
+	}
+
+	a.writeJSON(w, http.StatusOK, resp)
 }
 
 // HeatmapBin represents a single bin in the heatmap grid

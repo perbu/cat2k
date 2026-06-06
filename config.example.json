@@ -13,6 +13,7 @@
   "surehub_email": "your-surehub-email",
   "surehub_password": "your-surehub-password",
   "heatmap_days": 60,
+  "activity_timezone": "Europe/Oslo",
   "pois": [
     {"name": "Example Place", "lat": 59.9200, "lon": 10.7500, "color": "#888"}
   ]

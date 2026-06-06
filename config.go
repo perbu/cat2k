@@ -45,6 +45,24 @@ type Config struct {
 
 	// Heatmap configuration
 	HeatmapDays int `json:"heatmap_days"` // Number of days to include in heatmap (default: 60)
+
+	// Activity day-bucketing timezone (IANA name, e.g. "Europe/Oslo"). Day
+	// boundaries and "today" for the activity panel are computed in this zone.
+	// Empty falls back to the server's local timezone.
+	ActivityTimezone string `json:"activity_timezone"`
+}
+
+// ActivityLocation returns the timezone used to bucket activity into days.
+// Falls back to the server's local time if unset or unparseable.
+func (c *Config) ActivityLocation() (*time.Location, error) {
+	if c.ActivityTimezone == "" {
+		return time.Local, nil
+	}
+	loc, err := time.LoadLocation(c.ActivityTimezone)
+	if err != nil {
+		return time.Local, fmt.Errorf("invalid activity_timezone %q: %w", c.ActivityTimezone, err)
+	}
+	return loc, nil
 }
 
 // POI represents a point of interest on the radar
@@ -154,6 +172,9 @@ func loadConfig(configPath string) (*Config, error) {
 			cfg.HomeLon = lon
 		}
 	}
+	if val := os.Getenv("WEENECT_ACTIVITY_TIMEZONE"); val != "" {
+		cfg.ActivityTimezone = val
+	}
 	if val := os.Getenv("SUREHUB_EMAIL"); val != "" {
 		cfg.SureHubEmail = val
 	}
@@ -167,6 +188,11 @@ func loadConfig(configPath string) (*Config, error) {
 	}
 	if cfg.Password == "" {
 		return nil, fmt.Errorf("password is required (set WEENECT_PASSWORD or use config file)")
+	}
+	if cfg.ActivityTimezone != "" {
+		if _, err := time.LoadLocation(cfg.ActivityTimezone); err != nil {
+			return nil, fmt.Errorf("invalid activity_timezone %q (use an IANA name like Europe/Oslo): %w", cfg.ActivityTimezone, err)
+		}
 	}
 
 	return cfg, nil

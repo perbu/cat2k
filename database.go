@@ -107,6 +107,11 @@ CREATE TABLE IF NOT EXISTS positions (
 CREATE INDEX IF NOT EXISTS idx_positions_tracker_timestamp
   ON positions(tracker_id, timestamp);
 
+-- Supports time-range scans across all trackers (heatmap, activity), where the
+-- leading-column-tracker_id index above cannot seek on timestamp alone.
+CREATE INDEX IF NOT EXISTS idx_positions_timestamp
+  ON positions(timestamp);
+
 CREATE TABLE IF NOT EXISTS sync_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   tracker_id INTEGER,
@@ -484,6 +489,45 @@ func (d *Database) GetPositionsForHeatmap(since time.Time) (map[int][]HeatmapPos
 		err := rows.Scan(&p.TrackerID, &p.Latitude, &p.Longitude)
 		if err != nil {
 			return nil, err
+		}
+		result[p.TrackerID] = append(result[p.TrackerID], p)
+	}
+
+	return result, rows.Err()
+}
+
+// GetPositionsForActivity returns gated-eligible positions per tracker since a
+// given time, ordered by tracker and timestamp. Includes the quality fields
+// (satellites, valid_signal) needed to filter bad fixes during measurement.
+func (d *Database) GetPositionsForActivity(since time.Time) (map[int][]ActivityPosition, error) {
+	query := `
+		SELECT tracker_id, timestamp, latitude, longitude, satellites, valid_signal
+		FROM positions
+		WHERE timestamp >= ?
+		ORDER BY timestamp
+	`
+
+	rows, err := d.db.Query(query, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[int][]ActivityPosition)
+	for rows.Next() {
+		var p ActivityPosition
+		var sats sql.NullInt64
+		var valid sql.NullBool
+		if err := rows.Scan(&p.TrackerID, &p.Timestamp, &p.Latitude, &p.Longitude, &sats, &valid); err != nil {
+			return nil, err
+		}
+		if sats.Valid {
+			s := int(sats.Int64)
+			p.Satellites = &s
+		}
+		if valid.Valid {
+			v := valid.Bool
+			p.ValidSignal = &v
 		}
 		result[p.TrackerID] = append(result[p.TrackerID], p)
 	}
