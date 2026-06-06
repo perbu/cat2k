@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"embed"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"math"
 	"net/http"
@@ -13,6 +15,9 @@ import (
 
 	gosure "github.com/perbu/go-sure"
 )
+
+//go:embed all:web
+var webFS embed.FS
 
 // APIServer provides HTTP API for tracker data
 type APIServer struct {
@@ -51,9 +56,12 @@ func NewAPIServer(db *Database, cfg *Config, listenAddr string, logger *slog.Log
 	mux.HandleFunc("/api/activity", api.handleGetActivity)
 	mux.HandleFunc("/health", api.handleHealth)
 
-	// Static file serving for web UI
-	fs := http.FileServer(http.Dir("./web"))
-	mux.Handle("/", fs)
+	// Static file serving for web UI (embedded)
+	webRoot, err := fs.Sub(webFS, "web")
+	if err != nil {
+		panic(fmt.Sprintf("failed to access embedded web assets: %v", err))
+	}
+	mux.Handle("/", http.FileServer(http.FS(webRoot)))
 
 	// Wrap with middleware
 	handler := api.loggingMiddleware(api.corsMiddleware(mux))
