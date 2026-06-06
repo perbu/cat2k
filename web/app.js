@@ -11,9 +11,15 @@ const HEATMAP_PALETTES = [
     { 0.0: '#c01818', 0.4: '#ff4818', 0.7: '#ffa020', 1.0: '#ffe830' }
 ];
 
+// Recent-trail window. Mirrors the radar's server-side history window
+// (api.go: historyStart = now - 3h) so the map shows the same "where it just
+// went" path as status.html.
+const TRAIL_MAX_AGE_HOURS = 3;
+
 // State
 let map = null;
 let heatLayers = {};         // trackerId -> L.heatLayer
+let trailLayers = {};        // trackerId -> L.layerGroup of polyline segments
 let latestMarkers = {};      // trackerId -> L.marker
 let allTrackers = [];
 let currentDateRange = { days: 7 };
@@ -43,6 +49,59 @@ function paletteSwatch(palette) {
     const stops = Object.keys(palette).map(Number).sort((a, b) => a - b);
     const mid = stops[Math.floor(stops.length * 0.7)] ?? stops[stops.length - 1];
     return palette[mid] ?? '#888';
+}
+
+// Parse a #rrggbb color to RGB components (ported from status.html).
+function hexToRgb(hex) {
+    const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+    return result
+        ? { r: parseInt(result[1], 16), g: parseInt(result[2], 16), b: parseInt(result[3], 16) }
+        : { r: 255, g: 255, b: 255 };
+}
+
+// Style for one trail segment, faded by the age of its midpoint. Recent
+// segments show the tracker's color at full strength; older ones fade toward
+// dark and translucent so the freshest path reads clearly on the light map.
+function trailSegmentStyle(baseHex, midTimeMs) {
+    const ageHours = (Date.now() - midTimeMs) / (1000 * 60 * 60);
+    const fade = Math.min(ageHours / TRAIL_MAX_AGE_HOURS, 1);
+    const rgb = hexToRgb(baseHex);
+    const r = Math.round(rgb.r * (1 - fade));
+    const g = Math.round(rgb.g * (1 - fade));
+    const b = Math.round(rgb.b * (1 - fade));
+    return {
+        color: `rgb(${r}, ${g}, ${b})`,
+        opacity: 0.85 - fade * 0.55, // 0.85 (fresh) -> 0.30 (oldest)
+        weight: 3,
+        lineCap: 'round'
+    };
+}
+
+// One point on the Catmull-Rom spline through p1->p2, with p0/p3 as the
+// neighboring control points. t in [0,1]. Operates component-wise on [lat,lng].
+// Trades positional accuracy for smoother corners — the curve still passes
+// through every real fix, only the angles between them are rounded off.
+function catmullRom(p0, p1, p2, p3, t) {
+    const t2 = t * t;
+    const t3 = t2 * t;
+    const f = (a, b, c, d) =>
+        0.5 * ((2 * b) + (-a + c) * t + (2 * a - 5 * b + 4 * c - d) * t2 + (-a + 3 * b - 3 * c + d) * t3);
+    return [f(p0[0], p1[0], p2[0], p3[0]), f(p0[1], p1[1], p2[1], p3[1])];
+}
+
+// Subdivide segment pts[i]->pts[i+1] into a smooth curve, clamping control
+// points at the ends. Returns TRAIL_SPLINE_STEPS+1 [lat,lng] points.
+const TRAIL_SPLINE_STEPS = 12;
+function splineSegment(pts, i) {
+    const p0 = pts[i - 1] || pts[i];
+    const p1 = pts[i];
+    const p2 = pts[i + 1];
+    const p3 = pts[i + 2] || pts[i + 1];
+    const out = [];
+    for (let s = 0; s <= TRAIL_SPLINE_STEPS; s++) {
+        out.push(catmullRom(p0, p1, p2, p3, s / TRAIL_SPLINE_STEPS));
+    }
+    return out;
 }
 
 function makePinIcon(color) {
@@ -361,6 +420,43 @@ function calculateCenter(positions) {
     return [sumLat / positions.length, sumLng / positions.length];
 }
 
+// Draw the recent-movement trail per tracker: consecutive fixes within the
+// trail window joined as age-faded line segments, layered above the heatmap.
+// Reuses the positions already in positionsByTracker — no extra API call.
+function renderTrails() {
+    Object.values(trailLayers).forEach(group => map.removeLayer(group));
+    trailLayers = {};
+
+    const cutoff = Date.now() - TRAIL_MAX_AGE_HOURS * 60 * 60 * 1000;
+
+    sortedTrackerIds().forEach((id) => {
+        const positions = positionsByTracker[id] || [];
+
+        // Keep only fixes inside the window, oldest -> newest so segments
+        // connect in travel order. (positionsByTracker is newest-first.)
+        const recent = positions
+            .filter(p => new Date(p.timestamp).getTime() >= cutoff)
+            .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+        if (recent.length < 2) return;
+
+        const base = paletteSwatch(paletteForIndex(trackerPaletteIndex(id)));
+        const group = L.layerGroup();
+
+        // Coordinates the spline interpolates over (control points).
+        const pts = recent.map(p => [p.lat, p.lng]);
+
+        // One curved polyline per original segment, so each keeps its own
+        // age-fade color while the corners between fixes are rounded.
+        for (let i = 0; i < recent.length - 1; i++) {
+            const midTime = (new Date(recent[i].timestamp).getTime() + new Date(recent[i + 1].timestamp).getTime()) / 2;
+            L.polyline(splineSegment(pts, i), trailSegmentStyle(base, midTime)).addTo(group);
+        }
+
+        group.addTo(map);
+        trailLayers[id] = group;
+    });
+}
+
 // Render one heat layer per tracker, each with its assigned palette
 function renderHeatMaps(resetView = true) {
     Object.values(heatLayers).forEach(layer => map.removeLayer(layer));
@@ -400,6 +496,8 @@ function renderHeatMaps(resetView = true) {
 
         allPositions = allPositions.concat(positions);
     });
+
+    renderTrails();
 
     if (resetView && allPositions.length > 0) {
         const center = calculateCenter(allPositions);
