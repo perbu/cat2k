@@ -818,7 +818,27 @@
 			// Initialize heatmap after first status fetch (to get heatmap_days config)
 			initHeatmap(configuredHeatmapDays);
 		});
-		setInterval(fetchAndUpdate, 30 * 1000); // Update every 30 seconds
+
+		// Live updates via Server-Sent Events: the server pushes an "update"
+		// event after each sync (and on connect). EventSource auto-reconnects.
+		function connectEvents() {
+			const es = new EventSource('/api/events');
+			es.addEventListener('update', () => fetchAndUpdate());
+			// On error the browser reconnects automatically; nothing to do.
+		}
+		if (window.EventSource) {
+			connectEvents();
+		}
+
+		// Fallback poll in case SSE is blocked (e.g. by a proxy). Slow, since
+		// server data only changes every few minutes.
+		setInterval(fetchAndUpdate, 2 * 60 * 1000);
+
+		// Catch up immediately when a backgrounded/suspended tab is refocused,
+		// since browsers throttle or suspend timers in hidden tabs.
+		document.addEventListener('visibilitychange', () => {
+			if (!document.hidden) fetchAndUpdate();
+		});
 
 		// Fullscreen on double-tap (for Android Chrome)
 		let lastTap = 0;

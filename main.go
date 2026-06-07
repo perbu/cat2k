@@ -128,6 +128,9 @@ func runDaemon(cfg *Config) error {
 		apiServer = NewAPIServer(db, cfg, cfg.HTTPListen, logger)
 		apiServerErr = make(chan error, 1)
 
+		// Push live updates to connected browsers after each successful sync.
+		scheduler.onSyncComplete = apiServer.NotifyUpdate
+
 		go func() {
 			if err := apiServer.Start(); err != nil {
 				apiServerErr <- err

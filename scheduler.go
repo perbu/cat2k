@@ -14,6 +14,10 @@ type Scheduler struct {
 	worker   *SyncWorker
 	logger   *slog.Logger
 	cron     *cron.Cron
+
+	// onSyncComplete, if set, is called after each successful sync. Used to
+	// push live updates to connected web clients.
+	onSyncComplete func()
 }
 
 // newScheduler creates a new scheduler
@@ -42,6 +46,9 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			s.logger.Error("Scheduled sync failed", "error", err)
 		} else {
 			s.logger.Info("Scheduled sync completed successfully")
+			if s.onSyncComplete != nil {
+				s.onSyncComplete()
+			}
 		}
 	})
 	if err != nil {

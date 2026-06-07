@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	gosure "github.com/perbu/go-sure"
@@ -30,14 +31,20 @@ type APIServer struct {
 	// Cache for SureHub pet status
 	petStatusCache     map[string]petFlapStatus
 	petStatusCacheTime time.Time
+
+	// SSE subscribers: each connected browser gets a channel that receives a
+	// signal whenever new data is available. Guarded by sseMu.
+	sseMu      sync.Mutex
+	sseClients map[chan struct{}]struct{}
 }
 
 // NewAPIServer creates a new API server
 func NewAPIServer(db *Database, cfg *Config, listenAddr string, logger *slog.Logger) *APIServer {
 	api := &APIServer{
-		db:     db,
-		cfg:    cfg,
-		logger: logger,
+		db:         db,
+		cfg:        cfg,
+		logger:     logger,
+		sseClients: make(map[chan struct{}]struct{}),
 	}
 
 	// Initialize SureHub client if credentials are configured
@@ -54,6 +61,7 @@ func NewAPIServer(db *Database, cfg *Config, listenAddr string, logger *slog.Log
 	mux.HandleFunc("/api/status", api.handleGetStatus)
 	mux.HandleFunc("/api/heatmap", api.handleGetHeatmap)
 	mux.HandleFunc("/api/activity", api.handleGetActivity)
+	mux.HandleFunc("/api/events", api.handleEvents)
 	mux.HandleFunc("/health", api.handleHealth)
 
 	// Static file serving for web UI (embedded)
@@ -150,6 +158,96 @@ func (a *APIServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// subscribe registers a new SSE client and returns its notification channel.
+func (a *APIServer) subscribe() chan struct{} {
+	ch := make(chan struct{}, 1)
+	a.sseMu.Lock()
+	a.sseClients[ch] = struct{}{}
+	a.sseMu.Unlock()
+	return ch
+}
+
+// unsubscribe removes an SSE client and closes its channel. Guarded by the
+// same mutex as NotifyUpdate, so a send can never race a close.
+func (a *APIServer) unsubscribe(ch chan struct{}) {
+	a.sseMu.Lock()
+	if _, ok := a.sseClients[ch]; ok {
+		delete(a.sseClients, ch)
+		close(ch)
+	}
+	a.sseMu.Unlock()
+}
+
+// NotifyUpdate signals every connected SSE client that new data is available.
+// Slow clients (buffer already full) are skipped — the next event or heartbeat
+// will catch them up. Safe to call from any goroutine (e.g. the scheduler).
+func (a *APIServer) NotifyUpdate() {
+	a.sseMu.Lock()
+	defer a.sseMu.Unlock()
+	for ch := range a.sseClients {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// handleEvents handles GET /api/events - a Server-Sent Events stream that emits
+// an "update" event whenever fresh data is available, so browsers can refresh
+// without polling.
+func (a *APIServer) handleEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		a.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		a.writeError(w, http.StatusInternalServerError, "Streaming unsupported")
+		return
+	}
+
+	// This is a long-lived connection, so clear the server's 10s WriteTimeout
+	// for this request only — other endpoints keep their timeout.
+	rc := http.NewResponseController(w)
+	if err := rc.SetWriteDeadline(time.Time{}); err != nil {
+		a.logger.Debug("Failed to clear write deadline for SSE", "error", err)
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+
+	ch := a.subscribe()
+	defer a.unsubscribe(ch)
+
+	// Tell the client to fetch right away on (re)connect.
+	fmt.Fprint(w, "event: update\ndata: connected\n\n")
+	flusher.Flush()
+
+	// Heartbeat keeps the connection under the 60s IdleTimeout and lets the
+	// server notice dropped clients.
+	heartbeat := time.NewTicker(25 * time.Second)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case _, ok := <-ch:
+			if !ok {
+				return
+			}
+			fmt.Fprint(w, "event: update\ndata: sync\n\n")
+			flusher.Flush()
+		case <-heartbeat.C:
+			fmt.Fprint(w, ": ping\n\n")
+			flusher.Flush()
+		}
+	}
 }
 
 // handleGetTrackers handles GET /api/trackers
