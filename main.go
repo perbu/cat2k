@@ -125,7 +125,7 @@ func runDaemon(cfg *Config) error {
 	var apiServer *APIServer
 	var apiServerErr chan error
 	if cfg.HTTPEnabled {
-		apiServer = NewAPIServer(db, cfg, cfg.HTTPListen, logger)
+		apiServer = NewAPIServer(db, cfg, worker, cfg.HTTPListen, logger)
 		apiServerErr = make(chan error, 1)
 
 		// Push live updates to connected browsers after each successful sync.

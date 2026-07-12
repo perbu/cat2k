@@ -2,12 +2,17 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	weenect "github.com/perbu/weenect-go"
 )
+
+// ErrSyncInProgress is returned by TrySyncAll when a sync is already running.
+var ErrSyncInProgress = errors.New("sync already in progress")
 
 // SyncWorker handles synchronization of tracker data
 type SyncWorker struct {
@@ -16,6 +21,22 @@ type SyncWorker struct {
 	rateLimiter *RateLimiter
 	logger      *slog.Logger
 	cfg         *Config
+
+	// syncMu serializes syncs within the daemon so a manual (HTTP-triggered)
+	// sync and a scheduled sync never hit the Weenect client concurrently.
+	syncMu sync.Mutex
+}
+
+// TrySyncAll runs SyncAll only if no other sync is currently running. If one is
+// already in progress it returns ErrSyncInProgress immediately rather than
+// queueing, so callers (the scheduler and the manual /api/sync endpoint) can
+// skip or report the conflict instead of piling up redundant syncs.
+func (w *SyncWorker) TrySyncAll(ctx context.Context) error {
+	if !w.syncMu.TryLock() {
+		return ErrSyncInProgress
+	}
+	defer w.syncMu.Unlock()
+	return w.SyncAll(ctx)
 }
 
 // newSyncWorker creates a new sync worker

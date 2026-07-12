@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -42,9 +43,13 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		syncCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 		defer cancel()
 
-		if err := s.worker.SyncAll(syncCtx); err != nil {
+		err := s.worker.TrySyncAll(syncCtx)
+		switch {
+		case errors.Is(err, ErrSyncInProgress):
+			s.logger.Info("Scheduled sync skipped: a sync is already running")
+		case err != nil:
 			s.logger.Error("Scheduled sync failed", "error", err)
-		} else {
+		default:
 			s.logger.Info("Scheduled sync completed successfully")
 			if s.onSyncComplete != nil {
 				s.onSyncComplete()

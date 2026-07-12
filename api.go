@@ -4,6 +4,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -24,6 +25,7 @@ var webFS embed.FS
 type APIServer struct {
 	db         *Database
 	cfg        *Config
+	worker     *SyncWorker
 	server     *http.Server
 	logger     *slog.Logger
 	sureClient *gosure.Client
@@ -39,10 +41,11 @@ type APIServer struct {
 }
 
 // NewAPIServer creates a new API server
-func NewAPIServer(db *Database, cfg *Config, listenAddr string, logger *slog.Logger) *APIServer {
+func NewAPIServer(db *Database, cfg *Config, worker *SyncWorker, listenAddr string, logger *slog.Logger) *APIServer {
 	api := &APIServer{
 		db:         db,
 		cfg:        cfg,
+		worker:     worker,
 		logger:     logger,
 		sseClients: make(map[chan struct{}]struct{}),
 	}
@@ -62,6 +65,7 @@ func NewAPIServer(db *Database, cfg *Config, listenAddr string, logger *slog.Log
 	mux.HandleFunc("/api/heatmap", api.handleGetHeatmap)
 	mux.HandleFunc("/api/activity", api.handleGetActivity)
 	mux.HandleFunc("/api/events", api.handleEvents)
+	mux.HandleFunc("/api/sync", api.handleSync)
 	mux.HandleFunc("/health", api.handleHealth)
 
 	// Static file serving for web UI (embedded)
@@ -105,7 +109,7 @@ func (a *APIServer) Shutdown(ctx context.Context) error {
 func (a *APIServer) corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
 		if r.Method == "OPTIONS" {
@@ -157,6 +161,48 @@ func (a *APIServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	a.writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleSync handles POST /api/sync - triggers an immediate upstream resync
+// with Weenect. Runs synchronously (so the caller learns when it finishes) and
+// returns 409 if a sync is already running. On success, connected browsers are
+// notified via SSE so every open page refreshes.
+func (a *APIServer) handleSync(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		a.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	if a.worker == nil {
+		a.writeError(w, http.StatusServiceUnavailable, "Sync not available")
+		return
+	}
+
+	// A sync can outlast the server's 10s WriteTimeout, so clear the write
+	// deadline for this request only.
+	rc := http.NewResponseController(w)
+	if err := rc.SetWriteDeadline(time.Time{}); err != nil {
+		a.logger.Debug("Failed to clear write deadline for sync", "error", err)
+	}
+
+	// Detach from the request context so a browser navigating away mid-sync
+	// doesn't abort it — the fetched data should still be stored.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
+	a.logger.Info("Manual sync requested via API", "remote_addr", r.RemoteAddr)
+	err := a.worker.TrySyncAll(ctx)
+	if errors.Is(err, ErrSyncInProgress) {
+		a.writeError(w, http.StatusConflict, "A sync is already in progress")
+		return
+	}
+	if err != nil {
+		a.logger.Error("Manual sync failed", "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Sync failed")
+		return
+	}
+
+	a.NotifyUpdate()
 	a.writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 

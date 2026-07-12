@@ -588,8 +588,46 @@ async function loadAllTrackerData() {
     }
 }
 
+// Trigger an upstream resync with Weenect, then reload the map with the fresh
+// data. The POST is synchronous server-side, so it resolves only once the sync
+// has finished (or 409 if one was already running).
+async function triggerSync(btn) {
+    if (btn.disabled) return;
+
+    const label = btn.querySelector('.sync-label');
+    btn.disabled = true;
+    btn.classList.add('syncing');
+    if (label) label.textContent = 'Syncing…';
+
+    try {
+        const res = await fetch(`${API_BASE}/api/sync`, { method: 'POST' });
+        if (res.status === 409) {
+            showError('A sync is already in progress. Try again shortly.');
+        } else if (!res.ok) {
+            throw new Error(`Sync failed: ${res.statusText}`);
+        } else {
+            // Pull the freshly-synced positions into the map and panels.
+            await loadAllTrackerData();
+            loadActivity();
+        }
+    } catch (error) {
+        console.error('Error triggering sync:', error);
+        showError(error.message || 'Sync failed');
+    } finally {
+        btn.classList.remove('syncing');
+        if (label) label.textContent = 'Update';
+        btn.disabled = false;
+    }
+}
+
 // Setup event listeners
 function setupEventListeners() {
+    // Manual resync button
+    const syncBtn = document.getElementById('sync-btn');
+    if (syncBtn) {
+        syncBtn.addEventListener('click', () => triggerSync(syncBtn));
+    }
+
     // Date range preset buttons
     document.querySelectorAll('.date-presets .btn').forEach(btn => {
         btn.addEventListener('click', () => {
