@@ -11,10 +11,16 @@ const HEATMAP_PALETTES = [
     { 0.0: '#c01818', 0.4: '#ff4818', 0.7: '#ffa020', 1.0: '#ffe830' }
 ];
 
-// Recent-trail window. Mirrors the radar's server-side history window
-// (api.go: historyStart = now - 3h) so the map shows the same "where it just
-// went" path as status.html.
-const TRAIL_MAX_AGE_HOURS = 3;
+// The trail shows everything since 06:00 local this morning — the cat's day
+// so far. (status.html's radar keeps its own rolling 3h server-side window.)
+const TRAIL_START_HOUR = 6;
+
+// Trail fade is by absolute age, not window size: full strength for the last
+// hour, then fading out over TRAIL_FADE_HOURS.
+const TRAIL_FADE_HOURS = 12;
+
+// Hourly dots mark the fix nearest each whole hour, if within this tolerance.
+const HOUR_DOT_TOLERANCE_MIN = 15;
 
 // State
 let map = null;
@@ -59,12 +65,12 @@ function hexToRgb(hex) {
         : { r: 255, g: 255, b: 255 };
 }
 
-// Style for one trail segment, faded by the age of its midpoint. Recent
-// segments show the tracker's color at full strength; older ones fade toward
-// dark and translucent so the freshest path reads clearly on the light map.
+// Style for one trail segment, faded by the absolute age of its midpoint.
+// Fixes from the last hour show the tracker's color at full strength; older
+// ones fade toward dark and translucent so the freshest path reads clearly.
 function trailSegmentStyle(baseHex, midTimeMs) {
     const ageHours = (Date.now() - midTimeMs) / (1000 * 60 * 60);
-    const fade = Math.min(ageHours / TRAIL_MAX_AGE_HOURS, 1);
+    const fade = Math.min(Math.max((ageHours - 1) / (TRAIL_FADE_HOURS - 1), 0), 1);
     const rgb = hexToRgb(baseHex);
     const r = Math.round(rgb.r * (1 - fade));
     const g = Math.round(rgb.g * (1 - fade));
@@ -420,14 +426,20 @@ function calculateCenter(positions) {
     return [sumLat / positions.length, sumLng / positions.length];
 }
 
-// Draw the recent-movement trail per tracker: consecutive fixes within the
-// trail window joined as age-faded line segments, layered above the heatmap.
+// Draw the recent-movement trail per tracker: consecutive fixes since 06:00
+// joined as age-faded line segments, with an hourly dot at the fix nearest
+// each whole hour, layered above the heatmap.
 // Reuses the positions already in positionsByTracker — no extra API call.
 function renderTrails() {
     Object.values(trailLayers).forEach(group => map.removeLayer(group));
     trailLayers = {};
 
-    const cutoff = Date.now() - TRAIL_MAX_AGE_HOURS * 60 * 60 * 1000;
+    // Most recent 06:00 local time (yesterday's if it's currently before 6am).
+    const cutoffDate = new Date();
+    cutoffDate.setHours(TRAIL_START_HOUR, 0, 0, 0);
+    if (cutoffDate.getTime() > Date.now()) cutoffDate.setDate(cutoffDate.getDate() - 1);
+    const cutoff = cutoffDate.getTime();
+    const now = Date.now();
 
     sortedTrackerIds().forEach((id) => {
         const positions = positionsByTracker[id] || [];
@@ -450,6 +462,27 @@ function renderTrails() {
         for (let i = 0; i < recent.length - 1; i++) {
             const midTime = (new Date(recent[i].timestamp).getTime() + new Date(recent[i + 1].timestamp).getTime()) / 2;
             L.polyline(splineSegment(pts, i), trailSegmentStyle(base, midTime)).addTo(group);
+        }
+
+        // Hourly dots at the fix nearest each whole hour (within tolerance).
+        // Dots piling up on one spot = the cat stayed there. They mark real
+        // fixes, not spline-interpolated points.
+        for (let t = cutoff + 3600000; t <= now; t += 3600000) {
+            let best = null;
+            let bestDelta = Infinity;
+            recent.forEach(p => {
+                const delta = Math.abs(new Date(p.timestamp).getTime() - t);
+                if (delta < bestDelta) { bestDelta = delta; best = p; }
+            });
+            if (!best || bestDelta > HOUR_DOT_TOLERANCE_MIN * 60000) continue;
+
+            L.circleMarker([best.lat, best.lng], {
+                radius: 4.5,
+                color: '#fff',
+                weight: 1.5,
+                fillColor: base,
+                fillOpacity: 0.95
+            }).addTo(group).bindTooltip(new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
         }
 
         group.addTo(map);
