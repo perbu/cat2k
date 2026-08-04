@@ -3,14 +3,38 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Weenect Tracker Heat Map</title>
+    <title>Cat Tracker</title>
 
     <!-- Leaflet CSS -->
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
           integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
           crossorigin=""/>
 
+    <!-- Fonts: Hanken Grotesk (UI) + JetBrains Mono (numerals) -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
     <style>
+        :root {
+            --ink: #16181D;
+            --text-2: #5B626C;
+            --text-3: #9198A2;
+            --text-4: #B4BAC2;
+            --panel: #FFFFFF;
+            --card: #F8F9FA;
+            --card-border: #ECEEF1;
+            --hairline: #EEF0F2;
+            --seg-track: #F0F2F4;
+            --slider-track: #DFE3E7;
+            --canvas: #E7EBEA;
+            --bella: #17BE7E;
+            --luna: #F5991F;
+            --batt: #7A828C;
+            --batt-shell: #A8AEB6;
+            --batt-low: #E08A00;
+        }
+
         * {
             margin: 0;
             padding: 0;
@@ -18,11 +42,19 @@
         }
 
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            font-family: 'Hanken Grotesk', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             height: 100vh;
             display: flex;
             flex-direction: column;
             overflow: hidden;
+            background: var(--canvas);
+            color: var(--ink);
+            -webkit-font-smoothing: antialiased;
+        }
+
+        .mono {
+            font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-variant-numeric: tabular-nums;
         }
 
         #container {
@@ -32,11 +64,15 @@
         }
 
         #sidebar {
-            width: 320px;
-            background: #f8f9fa;
-            padding: 1.5rem;
+            width: 344px;
+            flex-shrink: 0;
+            background: var(--panel);
+            padding: 20px;
             overflow-y: auto;
-            box-shadow: 2px 0 4px rgba(0,0,0,0.1);
+            display: flex;
+            flex-direction: column;
+            gap: 18px;
+            box-shadow: 1px 0 0 var(--hairline);
             z-index: 800;
         }
 
@@ -45,271 +81,262 @@
             position: relative;
         }
 
-        .control-group {
-            margin-bottom: 1.5rem;
-        }
-
-        .control-group label {
-            display: block;
-            font-weight: 600;
-            margin-bottom: 0.5rem;
-            color: #2c3e50;
-            font-size: 0.9rem;
-        }
-
-        select, input[type="date"] {
-            width: 100%;
-            padding: 0.6rem;
-            border: 1px solid #dce0e3;
-            border-radius: 4px;
-            font-size: 0.9rem;
-            background: white;
-            transition: border-color 0.2s;
-        }
-
-        select:focus, input[type="date"]:focus {
-            outline: none;
-            border-color: #3498db;
-        }
-
-        .date-presets {
+        /* ---------- Header ---------- */
+        .panel-header {
             display: flex;
-            gap: 0.5rem;
-            margin-bottom: 0.75rem;
+            align-items: center;
+            gap: 10px;
         }
 
-        .btn {
-            padding: 0.5rem 0.75rem;
-            border: 1px solid #dce0e3;
-            border-radius: 4px;
-            background: white;
-            cursor: pointer;
-            font-size: 0.85rem;
-            transition: all 0.2s;
-            flex: 1;
-            text-align: center;
+        .brand-mark {
+            width: 26px;
+            height: 26px;
+            border-radius: 8px;
+            background: var(--ink);
+            display: grid;
+            place-items: center;
+            flex-shrink: 0;
         }
 
-        .btn:hover {
-            background: #ecf0f1;
+        .brand-name {
+            font-size: 16px;
+            font-weight: 700;
+            letter-spacing: -0.01em;
         }
 
-        .btn.active {
-            background: #3498db;
-            color: white;
-            border-color: #3498db;
+        .live {
+            margin-left: auto;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--bella);
         }
 
-        .btn-sync {
+        .live-dot {
+            position: relative;
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: var(--bella);
+        }
+
+        .live-dot::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            border-radius: 50%;
+            background: var(--bella);
+            animation: livePulse 2.4s ease-out infinite;
+        }
+
+        @keyframes livePulse {
+            0%   { transform: scale(1);   opacity: 0.6; }
+            80%  { transform: scale(2.4); opacity: 0; }
+            100% { opacity: 0; }
+        }
+
+        /* ---------- Update ---------- */
+        .btn-update {
             width: 100%;
-            padding: 0.7rem;
+            height: 40px;
             border: none;
-            border-radius: 4px;
-            background: #3498db;
-            color: white;
-            font-size: 0.95rem;
+            border-radius: 11px;
+            background: var(--ink);
+            color: #fff;
+            font-family: inherit;
+            font-size: 14px;
             font-weight: 600;
             cursor: pointer;
-            transition: background 0.2s;
             display: flex;
             align-items: center;
             justify-content: center;
-            gap: 0.5rem;
+            gap: 8px;
+            transition: opacity 0.15s;
         }
 
-        .btn-sync:hover:not(:disabled) {
-            background: #2980b9;
-        }
+        .btn-update:hover:not(:disabled) { opacity: 0.88; }
+        .btn-update:disabled { opacity: 0.55; cursor: default; }
 
-        .btn-sync:disabled {
-            background: #9bbcd1;
-            cursor: default;
-        }
-
-        .btn-sync .sync-icon {
+        .btn-update .sync-icon {
             display: inline-block;
-            font-size: 1.05rem;
+            font-size: 15px;
             line-height: 1;
         }
 
-        .btn-sync.syncing .sync-icon {
-            animation: spin 1s linear infinite;
+        .btn-update.syncing .sync-icon { animation: spin 1s linear infinite; }
+
+        .update-caption {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            margin-top: 8px;
+            font-size: 11.5px;
+            color: var(--text-3);
+        }
+
+        .update-caption .mono { font-size: 11.5px; color: var(--text-2); }
+
+        /* ---------- Section label ---------- */
+        .section-label {
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--text-3);
+            margin-bottom: 8px;
+        }
+
+        /* ---------- Segmented control ---------- */
+        .segmented {
+            display: flex;
+            gap: 3px;
+            background: var(--seg-track);
+            padding: 3px;
+            border-radius: 11px;
+        }
+
+        .seg {
+            flex: 1;
+            border: none;
+            background: transparent;
+            border-radius: 8px;
+            padding: 7px 0;
+            font-family: inherit;
+            font-size: 12.5px;
+            font-weight: 600;
+            color: var(--text-2);
+            cursor: pointer;
+            transition: background 0.15s, color 0.15s;
+        }
+
+        .seg:hover:not(.active) { color: var(--ink); }
+
+        .seg.active {
+            background: #fff;
+            color: var(--ink);
+            box-shadow: 0 1px 2px rgba(22,24,29,0.10), 0 0 0 0.5px rgba(22,24,29,0.04);
         }
 
         .date-inputs {
             display: flex;
-            gap: 0.5rem;
             flex-direction: column;
+            gap: 8px;
+            margin-top: 10px;
         }
 
-        .slider-group {
-            margin-bottom: 1rem;
-        }
-
-        .slider-label {
-            display: flex;
-            justify-content: space-between;
-            margin-bottom: 0.25rem;
-            font-size: 0.85rem;
-            color: #555;
-        }
-
-        .slider-value {
-            font-weight: 600;
-            color: #3498db;
-        }
-
-        input[type="range"] {
+        .date-inputs input[type="date"] {
             width: 100%;
-            height: 6px;
-            border-radius: 3px;
-            background: #dce0e3;
+            padding: 9px 11px;
+            border: 1px solid var(--card-border);
+            border-radius: 10px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12.5px;
+            color: var(--ink);
+            background: #fff;
+        }
+
+        .date-inputs input[type="date"]:focus {
             outline: none;
-            -webkit-appearance: none;
+            border-color: var(--ink);
         }
 
-        input[type="range"]::-webkit-slider-thumb {
-            -webkit-appearance: none;
-            appearance: none;
-            width: 16px;
-            height: 16px;
-            border-radius: 50%;
-            background: #3498db;
-            cursor: pointer;
-            transition: background 0.2s;
-        }
-
-        input[type="range"]::-webkit-slider-thumb:hover {
-            background: #2980b9;
-        }
-
-        input[type="range"]::-moz-range-thumb {
-            width: 16px;
-            height: 16px;
-            border-radius: 50%;
-            background: #3498db;
-            cursor: pointer;
-            border: none;
-            transition: background 0.2s;
-        }
-
-        input[type="range"]::-moz-range-thumb:hover {
-            background: #2980b9;
-        }
-
-        #stats-panel {
-            background: white;
-            border: 1px solid #dce0e3;
-            border-radius: 4px;
-            padding: 1rem;
-        }
-
-        .stat-row {
+        /* ---------- Cat cards ---------- */
+        #cat-cards {
             display: flex;
-            justify-content: space-between;
-            padding: 0.5rem 0;
-            border-bottom: 1px solid #ecf0f1;
+            flex-direction: column;
+            gap: 12px;
         }
 
-        .stat-row:last-child {
-            border-bottom: none;
+        .cat-card {
+            background: var(--card);
+            border: 1px solid var(--card-border);
+            border-radius: 14px;
+            padding: 13px 14px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
         }
 
-        .stat-label {
-            color: #7f8c8d;
-            font-size: 0.85rem;
-        }
-
-        .stat-value {
-            font-weight: 600;
-            color: #2c3e50;
-            font-size: 0.9rem;
-        }
-
-        .tracker-legend-item {
+        .cat-top {
             display: flex;
             align-items: center;
-            padding: 0.4rem 0;
-            font-size: 0.9rem;
-            color: #2c3e50;
+            gap: 8px;
         }
 
-        .tracker-legend-swatch {
-            width: 14px;
-            height: 14px;
-            border-radius: 3px;
-            margin-right: 0.6rem;
+        .cat-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
             flex-shrink: 0;
         }
 
-        #activity-panel {
-            background: white;
-            border: 1px solid #dce0e3;
-            border-radius: 4px;
-            padding: 0.75rem;
+        .cat-name {
+            font-size: 14.5px;
+            font-weight: 700;
+            letter-spacing: -0.01em;
         }
 
-        .activity-caption {
-            font-size: 0.72rem;
-            text-transform: uppercase;
-            letter-spacing: 0.04em;
-            color: #7f8c8d;
-            margin-bottom: 0.6rem;
-        }
-
-        .activity-empty {
-            color: #7f8c8d;
-            font-size: 0.85rem;
-            text-align: center;
-            padding: 0.5rem 0;
-        }
-
-        .activity-cat {
-            padding: 0.6rem 0;
-            border-bottom: 1px solid #ecf0f1;
-        }
-
-        .activity-cat:first-child {
-            padding-top: 0;
-        }
-
-        .activity-cat:last-child {
-            border-bottom: none;
-            padding-bottom: 0;
-        }
-
-        .activity-head {
+        /* Battery pill */
+        .battery {
+            margin-left: auto;
             display: flex;
             align-items: center;
-            margin-bottom: 0.4rem;
+            gap: 6px;
         }
 
-        .activity-name {
+        .batt-shell {
+            position: relative;
+            width: 18px;
+            height: 10px;
+            border: 1.4px solid var(--batt-shell);
+            border-radius: 2.5px;
+            padding: 1px;
+        }
+
+        .batt-shell::after {
+            content: '';
+            position: absolute;
+            right: -3px;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 1.6px;
+            height: 4px;
+            border-radius: 0 1px 1px 0;
+            background: var(--batt-shell);
+        }
+
+        .batt-fill {
+            display: block;
+            height: 100%;
+            background: var(--batt);
+            border-radius: 1px;
+        }
+
+        .batt-pct {
+            font-size: 11.5px;
             font-weight: 600;
-            color: #2c3e50;
-            font-size: 0.9rem;
+            color: var(--text-2);
         }
 
-        .activity-today {
-            margin-left: auto;
-            font-weight: 700;
-            color: #2c3e50;
-            font-size: 0.95rem;
+        .battery.low .batt-fill { background: var(--batt-low); }
+        .battery.low .batt-pct  { color: var(--batt-low); }
+
+        .cat-meta {
+            font-size: 12px;
+            color: var(--text-3);
+            margin-top: -2px;
         }
 
-        .activity-today small {
-            font-weight: 500;
-            color: #7f8c8d;
-            font-size: 0.7rem;
-        }
-
-        /* Bar chart: one bar per day, height scaled within the cat's own range */
-        .activity-bars {
+        /* Bar chart */
+        .cat-bars {
             display: flex;
             align-items: flex-end;
-            gap: 4px;
-            height: 40px;
-            margin-bottom: 0.35rem;
+            gap: 5px;
+            height: 52px;
         }
 
         .activity-bar {
@@ -323,53 +350,189 @@
 
         .activity-bar-fill {
             width: 100%;
-            border-radius: 2px 2px 0 0;
-            min-height: 2px;
+            border-radius: 3px;
+            min-height: 3px;
             transition: height 0.2s;
         }
 
-        .activity-bar.today .activity-bar-fill {
-            outline: 1px solid rgba(0,0,0,0.35);
-            outline-offset: -1px;
-        }
-
-        /* Day labels aligned under each bar */
-        .activity-labels {
+        .cat-daylabels {
             display: flex;
-            gap: 4px;
-            margin-bottom: 0.4rem;
+            gap: 5px;
         }
 
-        .activity-daylabel {
+        .cat-daylabels span {
             flex: 1;
             text-align: center;
-            font-size: 0.68rem;
-            color: #95a5a6;
+            font-size: 11px;
+            color: var(--text-4);
         }
 
-        .activity-daylabel.today {
-            color: #2c3e50;
+        .cat-daylabels span.today {
+            font-weight: 700;
+        }
+
+        .cat-divider {
+            height: 1px;
+            background: var(--hairline);
+        }
+
+        .cat-totals {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            font-size: 12px;
+            color: var(--text-3);
+        }
+
+        .cat-totals b {
             font-weight: 600;
+            font-size: 13px;
+            color: var(--ink);
         }
 
+        /* ---------- Heat map card ---------- */
+        .heatmap-card {
+            background: var(--card);
+            border: 1px solid var(--card-border);
+            border-radius: 14px;
+            padding: 13px 14px;
+        }
+
+        .heatmap-head {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .card-title { font-size: 13px; font-weight: 600; }
+        .card-sub   { font-size: 11.5px; color: var(--text-3); margin-top: 2px; }
+
+        .toggle {
+            margin-left: auto;
+            flex-shrink: 0;
+            width: 40px;
+            height: 24px;
+            border: none;
+            border-radius: 20px;
+            background: var(--slider-track);
+            cursor: pointer;
+            padding: 0;
+            position: relative;
+            transition: background 0.18s;
+        }
+
+        .toggle.on { background: var(--ink); }
+
+        .toggle .knob {
+            position: absolute;
+            top: 3px;
+            left: 3px;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: #fff;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.25);
+            transition: transform 0.18s;
+        }
+
+        .toggle.on .knob { transform: translateX(16px); }
+
+        .slider-stack {
+            margin-top: 14px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            transition: opacity 0.18s;
+        }
+
+        .slider-stack.auto {
+            opacity: 0.42;
+            pointer-events: none;
+        }
+
+        .slider-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .slider-row .slabel {
+            width: 56px;
+            flex-shrink: 0;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--text-3);
+        }
+
+        .slider-row .svalue {
+            width: 34px;
+            flex-shrink: 0;
+            text-align: right;
+            font-size: 12px;
+            color: var(--text-2);
+        }
+
+        input[type="range"] {
+            flex: 1;
+            height: 4px;
+            border-radius: 2px;
+            background: var(--slider-track);
+            outline: none;
+            -webkit-appearance: none;
+            appearance: none;
+        }
+
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #fff;
+            border: 1.5px solid var(--ink);
+            cursor: pointer;
+        }
+
+        input[type="range"]::-moz-range-thumb {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #fff;
+            border: 1.5px solid var(--ink);
+            cursor: pointer;
+        }
+
+        /* ---------- Footer ---------- */
+        .panel-footer {
+            margin-top: auto;
+            padding-top: 14px;
+            border-top: 1px solid var(--hairline);
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            font-size: 11.5px;
+            color: var(--text-3);
+        }
+
+        /* ---------- Activity tooltip ---------- */
         #activity-tooltip {
             position: fixed;
             z-index: 1100;
             pointer-events: none;
-            background: #2c3e50;
+            background: var(--ink);
             color: #fff;
             padding: 0.5rem 0.65rem;
-            border-radius: 6px;
-            font-size: 0.75rem;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.25);
+            border-radius: 8px;
+            font-size: 11.5px;
+            box-shadow: 0 6px 20px rgba(0,0,0,0.25);
             opacity: 0;
             transition: opacity 0.12s;
-            min-width: 130px;
+            min-width: 140px;
         }
 
-        #activity-tooltip.show {
-            opacity: 1;
-        }
+        #activity-tooltip.show { opacity: 1; }
 
         #activity-tooltip .tip-head {
             font-weight: 600;
@@ -382,46 +545,41 @@
             display: flex;
             justify-content: space-between;
             gap: 1rem;
-            line-height: 1.5;
+            line-height: 1.6;
         }
 
-        #activity-tooltip .tip-row span {
-            color: #b0bcc8;
-        }
+        #activity-tooltip .tip-row span { color: var(--text-4); }
+        #activity-tooltip .tip-row b { font-family: 'JetBrains Mono', monospace; font-weight: 500; }
 
-        /* Additive blending so overlapping heatmaps mix toward white in shared territory */
-        .leaflet-heatmap-layer {
-            mix-blend-mode: screen;
-        }
+        /* Additive blending so overlapping heatmaps mix toward white */
+        .leaflet-heatmap-layer { mix-blend-mode: screen; }
 
-        .cat-pin-icon {
-            background: transparent;
-            border: none;
-        }
+        .cat-pin-icon { background: transparent; border: none; }
 
+        /* ---------- Map overlays ---------- */
         #loading {
             position: absolute;
             top: 50%;
             left: 50%;
             transform: translate(-50%, -50%);
-            background: white;
+            background: #fff;
             padding: 2rem;
-            border-radius: 8px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            border-radius: 12px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.12);
             z-index: 1000;
             text-align: center;
+            color: var(--text-2);
+            font-size: 13px;
         }
 
-        #loading.hidden {
-            display: none;
-        }
+        #loading.hidden { display: none; }
 
         .spinner {
-            border: 3px solid #f3f3f3;
-            border-top: 3px solid #3498db;
+            border: 3px solid var(--hairline);
+            border-top: 3px solid var(--ink);
             border-radius: 50%;
-            width: 40px;
-            height: 40px;
+            width: 36px;
+            height: 36px;
             animation: spin 1s linear infinite;
             margin: 0 auto 1rem;
         }
@@ -435,14 +593,15 @@
             position: absolute;
             top: 1rem;
             right: 1rem;
-            background: #e74c3c;
-            color: white;
-            padding: 1rem;
-            border-radius: 4px;
-            max-width: 400px;
+            background: #E5484D;
+            color: #fff;
+            padding: 0.85rem 1rem;
+            border-radius: 10px;
+            max-width: 380px;
+            font-size: 13px;
             z-index: 1000;
             display: none;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+            box-shadow: 0 6px 20px rgba(0,0,0,0.2);
         }
 
         #error.show {
@@ -451,57 +610,53 @@
         }
 
         @keyframes slideIn {
-            from {
-                transform: translateX(100%);
-                opacity: 0;
-            }
-            to {
-                transform: translateX(0);
-                opacity: 1;
-            }
+            from { transform: translateX(100%); opacity: 0; }
+            to   { transform: translateX(0); opacity: 1; }
         }
 
         @media (max-width: 768px) {
-            #container {
-                flex-direction: column;
-            }
-
-            #sidebar {
-                width: 100%;
-                max-height: 40vh;
-            }
+            #container { flex-direction: column; }
+            #sidebar { width: 100%; max-height: 45vh; }
         }
     </style>
 </head>
 <body>
     <div id="container">
         <div id="sidebar">
-            <div class="control-group">
-                <button id="sync-btn" class="btn-sync" title="Fetch the latest positions from Weenect now">
+            <!-- Header -->
+            <div class="panel-header">
+                <span class="brand-mark">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="#fff" aria-hidden="true">
+                        <ellipse cx="6" cy="9.5" rx="2.1" ry="2.9"/>
+                        <ellipse cx="12" cy="7" rx="2.3" ry="3.1"/>
+                        <ellipse cx="18" cy="9.5" rx="2.1" ry="2.9"/>
+                        <path d="M12 12c-2.8 0-5 2-5 4.4C7 18.4 8.7 19.5 12 19.5s5-1.1 5-3.1C17 14 14.8 12 12 12z"/>
+                    </svg>
+                </span>
+                <span class="brand-name">Cat Tracker</span>
+                <span class="live"><span class="live-dot"></span>Live</span>
+            </div>
+
+            <!-- Update -->
+            <div>
+                <button id="sync-btn" class="btn-update" title="Fetch the latest positions from Weenect now">
                     <span class="sync-icon">↻</span>
                     <span class="sync-label">Update</span>
                 </button>
-            </div>
-
-            <div class="control-group">
-                <label>Trackers</label>
-                <div id="tracker-legend"></div>
-            </div>
-
-            <div class="control-group">
-                <label>Activity</label>
-                <div id="activity-panel">
-                    <div class="activity-empty">Loading…</div>
+                <div class="update-caption">
+                    <span id="update-time">Updated —</span>
+                    <span id="update-count" class="mono">—</span>
                 </div>
             </div>
 
-            <div class="control-group">
-                <label>Date Range</label>
-                <div class="date-presets">
-                    <button class="btn active" data-days="7">7 Days</button>
-                    <button class="btn" data-days="30">30 Days</button>
-                    <button class="btn" data-days="90">90 Days</button>
-                    <button class="btn" data-days="custom">Custom</button>
+            <!-- Date range -->
+            <div>
+                <div class="section-label">Date range</div>
+                <div class="segmented" id="date-presets">
+                    <button class="seg active" data-days="7">7d</button>
+                    <button class="seg" data-days="30">30d</button>
+                    <button class="seg" data-days="90">90d</button>
+                    <button class="seg" data-days="custom">Custom</button>
                 </div>
                 <div class="date-inputs" id="custom-dates" style="display: none;">
                     <input type="date" id="start-date" />
@@ -509,54 +664,50 @@
                 </div>
             </div>
 
-            <div class="control-group">
-                <label>Heat Map Settings</label>
-                <div class="slider-group">
-                    <div class="slider-label">
-                        <span>Intensity</span>
-                        <span class="slider-value" id="intensity-value">0.3</span>
+            <!-- Cat cards -->
+            <div id="cat-cards"></div>
+
+            <!-- Heat map -->
+            <div class="heatmap-card">
+                <div class="heatmap-head">
+                    <div>
+                        <div class="card-title">Auto-tune</div>
+                        <div class="card-sub">Heat map adapts to zoom &amp; density</div>
                     </div>
-                    <input type="range" id="intensity-slider" min="0.05" max="1.0" step="0.05" value="0.3">
+                    <button class="toggle on" id="autotune-toggle" role="switch" aria-checked="true" aria-label="Auto-tune heat map">
+                        <span class="knob"></span>
+                    </button>
                 </div>
-                <div class="slider-group">
-                    <div class="slider-label">
-                        <span>Radius</span>
-                        <span class="slider-value" id="radius-value">25</span>
+                <div class="slider-stack auto" id="slider-stack">
+                    <div class="slider-row">
+                        <span class="slabel">Intensity</span>
+                        <input type="range" id="intensity-slider" min="0.05" max="1.0" step="0.05" value="0.3">
+                        <span class="svalue mono" id="intensity-value">0.30</span>
                     </div>
-                    <input type="range" id="radius-slider" min="10" max="50" step="5" value="25">
-                </div>
-                <div class="slider-group">
-                    <div class="slider-label">
-                        <span>Blur</span>
-                        <span class="slider-value" id="blur-value">15</span>
+                    <div class="slider-row">
+                        <span class="slabel">Radius</span>
+                        <input type="range" id="radius-slider" min="10" max="50" step="5" value="25">
+                        <span class="svalue mono" id="radius-value">25</span>
                     </div>
-                    <input type="range" id="blur-slider" min="5" max="30" step="5" value="15">
+                    <div class="slider-row">
+                        <span class="slabel">Blur</span>
+                        <input type="range" id="blur-slider" min="5" max="30" step="5" value="15">
+                        <span class="svalue mono" id="blur-value">15</span>
+                    </div>
                 </div>
             </div>
 
-            <div class="control-group">
-                <label>Statistics</label>
-                <div id="stats-panel">
-                    <div class="stat-row">
-                        <span class="stat-label">Total Positions</span>
-                        <span class="stat-value" id="stat-count">-</span>
-                    </div>
-                    <div class="stat-row">
-                        <span class="stat-label">Date Range</span>
-                        <span class="stat-value" id="stat-range">-</span>
-                    </div>
-                    <div class="stat-row">
-                        <span class="stat-label">Latest Update</span>
-                        <span class="stat-value" id="stat-latest">-</span>
-                    </div>
-                </div>
+            <!-- Footer -->
+            <div class="panel-footer">
+                <span class="mono" id="footer-count">—</span>
+                <span id="footer-since">—</span>
             </div>
         </div>
 
         <div id="map">
             <div id="loading">
                 <div class="spinner"></div>
-                <div>Loading tracker data...</div>
+                <div>Loading tracker data…</div>
             </div>
 
             <div id="error"></div>

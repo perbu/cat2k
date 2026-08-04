@@ -22,6 +22,23 @@ const TRAIL_FADE_HOURS = 12;
 // Hourly dots mark the fix nearest each whole hour, if within this tolerance.
 const HOUR_DOT_TOLERANCE_MIN = 15;
 
+// Initial map zoom when data first loads (Leaflet levels: higher = closer;
+// OSM tiles go to 19, the heat layer to 17). Starts zoomed in on the cats.
+const DEFAULT_ZOOM = 17;
+
+// Per-cat accent colours (DESIGN.md). Indexed in the same id-sorted order as
+// the heatmap palettes, so cat #0 (Bella) is green and cat #1 (Luna) is orange.
+// Used ONLY in the control panel — the cat's own dot + activity chart. The map
+// keeps its blue/red heatmap palettes (see HEATMAP_PALETTES above).
+const CAT_ACCENTS = [
+    { color: '#17BE7E', muted: '#BEEBD6' }, // Bella
+    { color: '#F5991F', muted: '#FBDDB4' }  // Luna
+];
+
+function accentForIndex(idx) {
+    return CAT_ACCENTS[idx % CAT_ACCENTS.length];
+}
+
 // State
 let map = null;
 let heatLayers = {};         // trackerId -> L.heatLayer
@@ -30,7 +47,10 @@ let latestMarkers = {};      // trackerId -> L.marker
 let allTrackers = [];
 let currentDateRange = { days: 7 };
 let positionsByTracker = {}; // trackerId -> positions[]
+let activityData = null;     // most recent /api/activity response
+let pois = [];               // points of interest from /api/status
 let heatMapSettings = {
+    auto: true,              // "Auto-tune" toggle — derive from zoom/density
     intensity: 0.3,
     radius: 25,
     blur: 15
@@ -178,8 +198,10 @@ function sortedTrackerIds() {
     return Object.keys(positionsByTracker).map(Number).sort((a, b) => a - b);
 }
 
-// Update statistics panel
-function updateStats() {
+// Update the header caption and slim footer: position count, last-update time,
+// and the range start date. These readouts used to live in a "Statistics" block;
+// the redesign folds them into the chrome (DESIGN.md §3).
+function updateMeta() {
     const range = getDateRange();
     const ids = sortedTrackerIds();
 
@@ -195,15 +217,27 @@ function updateStats() {
         }
     });
 
-    document.getElementById('stat-count').textContent = total || '-';
+    const countStr = total ? total.toLocaleString() : '—';
+    const positionsStr = total ? `${countStr} positions` : '—';
 
-    if (range.start && range.end) {
-        const startStr = range.start.toLocaleDateString();
-        const endStr = range.end.toLocaleDateString();
-        document.getElementById('stat-range').textContent = `${startStr} - ${endStr}`;
+    const timeEl = document.getElementById('update-time');
+    if (timeEl) {
+        timeEl.textContent = latestOverall
+            ? `Updated ${latestOverall.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}`
+            : 'Updated —';
     }
+    setText('update-count', positionsStr);
+    setText('footer-count', positionsStr);
 
-    document.getElementById('stat-latest').textContent = latestOverall ? latestOverall.toLocaleString() : '-';
+    if (range.start) {
+        const sinceStr = range.start.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+        setText('footer-since', `since ${sinceStr}`);
+    }
+}
+
+function setText(id, text) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = text;
 }
 
 // Fetch trackers from API
@@ -241,33 +275,60 @@ async function fetchPositions(trackerID, start, end) {
     return data.positions || [];
 }
 
-// Populate tracker legend (color swatch + name)
-function populateTrackerLegend(trackers) {
-    const legend = document.getElementById('tracker-legend');
-    legend.innerHTML = '';
-
-    if (trackers.length === 0) {
-        legend.innerHTML = '<div class="tracker-legend-item">No trackers found</div>';
-        return;
-    }
-
-    const sorted = [...trackers].sort((a, b) => a.id - b.id);
-    sorted.forEach((tracker) => {
-        const swatch = paletteSwatch(paletteForIndex(trackerPaletteIndex(tracker.id)));
-        const item = document.createElement('div');
-        item.className = 'tracker-legend-item';
-        item.innerHTML = `
-            <span class="tracker-legend-swatch" style="background: ${swatch}"></span>
-            ${tracker.name}
-        `;
-        legend.appendChild(item);
-    });
-}
-
 // Format a distance in metres for display.
 function formatDistance(m) {
     if (m >= 1000) return `${(m / 1000).toFixed(1)} km`;
     return `${Math.round(m)} m`;
+}
+
+// Great-circle distance in metres between two lat/lon points (haversine).
+// Mirrors haversineDistance() in api.go so the panel's "distance from POI"
+// matches server-side maths.
+function haversineMeters(lat1, lon1, lat2, lon2) {
+    const R = 6371000;
+    const toRad = (d) => d * Math.PI / 180;
+    const dPhi = toRad(lat2 - lat1);
+    const dLambda = toRad(lon2 - lon1);
+    const a = Math.sin(dPhi / 2) ** 2
+        + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLambda / 2) ** 2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// Closest configured POI to a point, with its distance. Null when no POIs.
+function nearestPOI(lat, lng) {
+    let best = null;
+    let bestDist = Infinity;
+    for (const p of pois) {
+        const d = haversineMeters(lat, lng, p.lat, p.lon);
+        if (d < bestDist) { bestDist = d; best = p; }
+    }
+    return best ? { poi: best, dist: bestDist } : null;
+}
+
+// Human-friendly "time since" for the last-seen line.
+function relativeTime(date) {
+    const secs = Math.floor((Date.now() - date.getTime()) / 1000);
+    if (secs < 45) return 'just now';
+    const mins = Math.round(secs / 60);
+    if (mins < 60) return `${mins} min ago`;
+    const hrs = Math.round(mins / 60);
+    if (hrs < 24) return `${hrs} h ago`;
+    const days = Math.round(hrs / 24);
+    return `${days} d ago`;
+}
+
+// Battery pill markup: a shell whose inner fill width is the charge %, followed
+// by the percentage in mono. Turns amber below 20% (DESIGN.md battery rule).
+function batteryPill(pct) {
+    if (pct === null || pct === undefined) {
+        return '<span class="battery"><span class="batt-pct mono">—</span></span>';
+    }
+    const clamped = Math.max(0, Math.min(100, pct));
+    const low = clamped < 20 ? ' low' : '';
+    return `<span class="battery${low}">
+        <span class="batt-shell"><span class="batt-fill" style="width:${clamped}%"></span></span>
+        <span class="batt-pct mono">${clamped}%</span>
+    </span>`;
 }
 
 // Fetch per-cat activity summary
@@ -279,71 +340,102 @@ async function fetchActivity(days = 4) {
     return response.json();
 }
 
-// Render the per-cat activity panel. Colors match the tracker legend on this
-// page: swatch by palette, indexed in id-sorted order.
-function renderActivity(data) {
-    const panel = document.getElementById('activity-panel');
-    panel.innerHTML = '';
+// Render one merged card per cat: identity (dot + name) + status (battery,
+// last-seen) + activity (7-day distance chart, today/week totals). Draws from
+// both the tracker roster and whatever activity/position data has arrived so
+// far, so it renders progressively as each source loads (DESIGN.md §1).
+function renderCatCards() {
+    const container = document.getElementById('cat-cards');
+    if (!container) return;
 
-    const trackers = [...(data.trackers || [])].sort((a, b) => a.id - b.id);
-    if (trackers.length === 0) {
-        panel.innerHTML = '<div class="activity-empty">No activity data</div>';
+    const roster = [...allTrackers].sort((a, b) => a.id - b.id);
+    if (roster.length === 0) {
+        container.innerHTML = '';
         return;
     }
 
-    const caption = document.createElement('div');
-    caption.className = 'activity-caption';
-    caption.textContent = 'Distance travelled per day';
-    panel.appendChild(caption);
+    // Index activity payload by tracker id for quick lookup.
+    const activityById = {};
+    (activityData?.trackers || []).forEach(t => { activityById[t.id] = t; });
 
     const dayLabel = (date) => new Date(date + 'T00:00:00')
         .toLocaleDateString(undefined, { weekday: 'short' });
 
-    trackers.forEach((tracker) => {
-        const color = paletteSwatch(paletteForIndex(trackerPaletteIndex(tracker.id)));
-        const days = tracker.days || [];
-        const today = days[days.length - 1];
-        const maxDist = Math.max(1, ...days.map(d => d.distance_m));
+    container.innerHTML = roster.map((tracker) => {
+        const accent = accentForIndex(trackerPaletteIndex(tracker.id));
+        const days = activityById[tracker.id]?.days || [];
 
+        // Status from the latest stored position (newest-first list).
+        const positions = positionsByTracker[tracker.id] || [];
+        const latest = positions[0];
+        const battery = latest ? batteryPill(latest.battery) : batteryPill(null);
+        let lastSeen = 'No recent fixes';
+        if (latest) {
+            lastSeen = `Last seen ${relativeTime(new Date(latest.timestamp))}`;
+            const near = nearestPOI(latest.lat, latest.lng);
+            if (near) {
+                lastSeen += ` · ${formatDistance(near.dist)} from ${near.poi.name}`;
+            }
+        }
+
+        // Bars: height = share of the cat's own peak day. Last bar (today) uses
+        // the full accent; earlier days use the muted accent tint.
+        const maxDist = Math.max(1, ...days.map(d => d.distance_m));
         const bars = days.map((d, i) => {
             const isToday = i === days.length - 1;
             const pct = Math.round((d.distance_m / maxDist) * 100);
-            // Day stats are carried on the element for the hover popup.
+            const fill = isToday ? accent.color : accent.muted;
             const data = `data-name="${tracker.name}" data-date="${d.date}"`
                 + ` data-dist="${d.distance_m}" data-range="${d.range_m}"`
                 + ` data-active="${d.active_fraction}" data-fixes="${d.fixes}"`;
             return `<div class="activity-bar ${isToday ? 'today' : ''}" ${data}>
-                <div class="activity-bar-fill" style="height: ${pct}%; background: ${color}"></div>
+                <div class="activity-bar-fill" style="height:${pct}%;background:${fill}"></div>
             </div>`;
         }).join('');
 
         const labels = days.map((d, i) => {
             const isToday = i === days.length - 1;
-            const text = isToday ? 'today' : dayLabel(d.date);
-            return `<div class="activity-daylabel ${isToday ? 'today' : ''}">${text}</div>`;
+            const text = isToday ? 'Today' : dayLabel(d.date);
+            const style = isToday ? ` style="color:${accent.color}"` : '';
+            return `<span class="${isToday ? 'today' : ''}"${style}>${text}</span>`;
         }).join('');
 
-        const todayDist = today ? formatDistance(today.distance_m) : '–';
+        const chart = days.length
+            ? `<div class="cat-bars">${bars}</div><div class="cat-daylabels">${labels}</div>`
+            : '';
 
-        const cat = document.createElement('div');
-        cat.className = 'activity-cat';
-        cat.innerHTML = `
-            <div class="activity-head">
-                <span class="tracker-legend-swatch" style="background: ${color}"></span>
-                <span class="activity-name">${tracker.name}</span>
-                <span class="activity-today">${todayDist} <small>today</small></span>
-            </div>
-            <div class="activity-bars">${bars}</div>
-            <div class="activity-labels">${labels}</div>
-        `;
-        panel.appendChild(cat);
-    });
+        const today = days[days.length - 1];
+        const weekDist = days.reduce((sum, d) => sum + d.distance_m, 0);
+        const totals = days.length ? `
+            <div class="cat-divider"></div>
+            <div class="cat-totals">
+                <span><b class="mono">${formatDistance(today ? today.distance_m : 0)}</b> today</span>
+                <span><b class="mono">${formatDistance(weekDist)}</b> / wk</span>
+            </div>` : '';
 
-    attachActivityTooltip(panel);
+        return `
+            <div class="cat-card">
+                <div class="cat-top">
+                    <span class="cat-dot" style="background:${accent.color}"></span>
+                    <span class="cat-name">${tracker.name}</span>
+                    ${battery}
+                </div>
+                <div class="cat-meta">${lastSeen}</div>
+                ${chart}
+                ${totals}
+            </div>`;
+    }).join('');
+
+    attachActivityTooltip(container);
 }
 
-// Single floating popup, shared by all bars, shown on hover.
+// Single floating popup, shared by all bars, shown on hover. Idempotent: the
+// container element persists across re-renders (only its innerHTML changes), so
+// the hover listeners are bound at most once.
 function attachActivityTooltip(panel) {
+    if (panel.dataset.tipBound) return;
+    panel.dataset.tipBound = '1';
+
     let tip = document.getElementById('activity-tooltip');
     if (!tip) {
         tip = document.createElement('div');
@@ -384,20 +476,33 @@ function attachActivityTooltip(panel) {
     panel.addEventListener('mouseleave', hide);
 }
 
-// Load and render activity, swallowing errors (it's a secondary panel)
+// Load configured POIs (from /api/status) so cards can show the nearest one.
+// Swallows errors — without POIs the last-seen line just omits the location.
+async function loadPOIs() {
+    try {
+        const res = await fetch(`${API_BASE}/api/status`);
+        if (!res.ok) return;
+        const data = await res.json();
+        pois = data.pois || [];
+        renderCatCards();
+    } catch (err) {
+        console.error('Error loading POIs:', err);
+    }
+}
+
+// Load activity data and re-render the cat cards. Swallows errors — the cards
+// still render their identity/status half from position data alone.
 async function loadActivity() {
     try {
-        const data = await fetchActivity(7);
-        renderActivity(data);
+        activityData = await fetchActivity(7);
+        renderCatCards();
     } catch (err) {
         console.error('Error loading activity:', err);
-        document.getElementById('activity-panel').innerHTML =
-            '<div class="activity-empty">Activity unavailable</div>';
     }
 }
 
 // Initialize the map
-function initMap(center = [59.9139, 10.7522], zoom = 13) {
+function initMap(center = [59.9139, 10.7522], zoom = DEFAULT_ZOOM) {
     if (map) {
         return;
     }
@@ -408,6 +513,12 @@ function initMap(center = [59.9139, 10.7522], zoom = 13) {
         attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
         maxZoom: 19
     }).addTo(map);
+
+    // Re-tune the heat map when the zoom changes, so radius/blur track scale
+    // while Auto-tune is on. No-op (bar a cheap re-render) when it's off.
+    map.on('zoomend', () => {
+        if (heatMapSettings.auto) renderHeatMaps(false);
+    });
 }
 
 function calculateCenter(positions) {
@@ -490,8 +601,52 @@ function renderTrails() {
     });
 }
 
+// Derive heat-map settings from the current map zoom and point density, used
+// when "Auto-tune" is on. Radius/blur are pixel values, so they track zoom;
+// intensity per point falls as the total point count rises, so dense ranges
+// don't wash out to solid colour. Mutates heatMapSettings and syncs the (view-
+// only) slider UI so the numbers stay honest.
+function applyAutoTune() {
+    const zoom = map ? map.getZoom() : 13;
+    const radius = Math.round(Math.max(6, Math.min(22, (zoom - 7) * 2)));
+    const blur = Math.round(radius * 0.6);
+    const total = Object.values(positionsByTracker).reduce((n, p) => n + p.length, 0);
+    const intensity = Math.max(0.08, Math.min(0.5, 24 / Math.sqrt(Math.max(1, total))));
+
+    heatMapSettings.radius = radius;
+    heatMapSettings.blur = blur;
+    heatMapSettings.intensity = intensity;
+    syncSliderUI();
+}
+
+// Reflect heatMapSettings into the slider inputs and their value labels.
+function syncSliderUI() {
+    const set = (slider, value, label, text) => {
+        const s = document.getElementById(slider);
+        const l = document.getElementById(label);
+        if (s) s.value = value;
+        if (l) l.textContent = text;
+    };
+    set('intensity-slider', heatMapSettings.intensity, 'intensity-value', heatMapSettings.intensity.toFixed(2));
+    set('radius-slider', heatMapSettings.radius, 'radius-value', heatMapSettings.radius);
+    set('blur-slider', heatMapSettings.blur, 'blur-value', heatMapSettings.blur);
+}
+
+// Enable/disable the slider group to match the Auto-tune toggle. When auto is
+// on the group is dimmed and inert; the sliders only drive the map by hand.
+function applyAutoUIState() {
+    const stack = document.getElementById('slider-stack');
+    if (stack) stack.classList.toggle('auto', heatMapSettings.auto);
+    ['intensity-slider', 'radius-slider', 'blur-slider'].forEach(id => {
+        const s = document.getElementById(id);
+        if (s) s.disabled = heatMapSettings.auto;
+    });
+}
+
 // Render one heat layer per tracker, each with its assigned palette
 function renderHeatMaps(resetView = true) {
+    if (heatMapSettings.auto) applyAutoTune();
+
     Object.values(heatLayers).forEach(layer => map.removeLayer(layer));
     heatLayers = {};
     Object.values(latestMarkers).forEach(marker => map.removeLayer(marker));
@@ -535,7 +690,7 @@ function renderHeatMaps(resetView = true) {
     if (resetView && allPositions.length > 0) {
         const center = calculateCenter(allPositions);
         if (center) {
-            map.setView(center, 13);
+            map.setView(center, DEFAULT_ZOOM);
         }
     }
 
@@ -578,9 +733,11 @@ async function loadAllTrackerData() {
         }
 
         renderHeatMaps(isFirstLoad);
-        updateStats();
+        renderCatCards();
+        updateMeta();
 
         setLoading(false);
+        applyAutoUIState();
     } catch (error) {
         console.error('Error loading tracker data:', error);
         setLoading(false);
@@ -628,10 +785,10 @@ function setupEventListeners() {
         syncBtn.addEventListener('click', () => triggerSync(syncBtn));
     }
 
-    // Date range preset buttons
-    document.querySelectorAll('.date-presets .btn').forEach(btn => {
+    // Date range segmented control
+    document.querySelectorAll('#date-presets .seg').forEach(btn => {
         btn.addEventListener('click', () => {
-            document.querySelectorAll('.date-presets .btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('#date-presets .seg').forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
 
             const days = btn.dataset.days;
@@ -659,7 +816,21 @@ function setupEventListeners() {
         }
     });
 
-    // Heat map setting sliders — re-render with cached positions, no refetch
+    // Auto-tune toggle: when on, settings derive from zoom/density and the
+    // slider group is inert; when off, the sliders drive the heat map by hand.
+    const toggle = document.getElementById('autotune-toggle');
+    if (toggle) {
+        toggle.addEventListener('click', () => {
+            heatMapSettings.auto = !heatMapSettings.auto;
+            toggle.classList.toggle('on', heatMapSettings.auto);
+            toggle.setAttribute('aria-checked', String(heatMapSettings.auto));
+            applyAutoUIState();
+            renderHeatMaps(false);
+        });
+    }
+
+    // Heat map setting sliders — re-render with cached positions, no refetch.
+    // Only active while Auto-tune is off (the group is inert otherwise).
     document.getElementById('intensity-slider').addEventListener('input', (e) => {
         heatMapSettings.intensity = parseFloat(e.target.value);
         document.getElementById('intensity-value').textContent = heatMapSettings.intensity.toFixed(2);
@@ -679,6 +850,22 @@ function setupEventListeners() {
     });
 }
 
+// Subscribe to the server's SSE stream so the map refreshes whenever a sync
+// lands (same "Live" behaviour as the radar page). The browser auto-reconnects
+// on error; we ignore the initial "connected" event since we just loaded.
+function initLiveUpdates() {
+    try {
+        const es = new EventSource(`${API_BASE}/api/events`);
+        es.addEventListener('update', (e) => {
+            if (e.data === 'connected') return;
+            loadAllTrackerData();
+            loadActivity();
+        });
+    } catch (err) {
+        console.error('Live updates unavailable:', err);
+    }
+}
+
 // Main initialization function
 async function init() {
     try {
@@ -686,6 +873,7 @@ async function init() {
 
         initializeDateInputs();
         setupEventListeners();
+        applyAutoUIState();
 
         allTrackers = await fetchTrackers();
 
@@ -695,10 +883,12 @@ async function init() {
 
         console.log(`Found ${allTrackers.length} tracker(s)`);
 
-        populateTrackerLegend(allTrackers);
+        renderCatCards();   // identity/status skeleton before data arrives
         loadActivity();
+        loadPOIs();
 
         await loadAllTrackerData();
+        initLiveUpdates();
 
     } catch (error) {
         console.error('Error initializing app:', error);
