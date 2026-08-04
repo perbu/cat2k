@@ -3,6 +3,8 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -126,11 +128,56 @@ CREATE TABLE IF NOT EXISTS sync_log (
 );
 `
 
+// ensureDatabaseDir checks that the database file's directory exists, creating
+// it if only the leaf is missing. A deeper gap usually means a typo in
+// database_path, and SQLite reports that as a misleading "out of memory" error,
+// so fail early with the actual path instead.
+func ensureDatabaseDir(dbPath string) error {
+	if dbPath == ":memory:" {
+		return nil
+	}
+
+	dir := filepath.Dir(dbPath)
+	if info, err := os.Stat(dir); err == nil {
+		if !info.IsDir() {
+			return fmt.Errorf("database directory %s is not a directory", dir)
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("failed to stat database directory %s: %w", dir, err)
+	}
+
+	// Only create the leaf directory: if its parent is missing too, the path is
+	// more likely wrong than genuinely uncreated.
+	if parent := filepath.Dir(dir); parent != dir {
+		if _, err := os.Stat(parent); err != nil {
+			return fmt.Errorf("database directory %s does not exist (and neither does %s) - check database_path", dir, parent)
+		}
+	}
+
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		return fmt.Errorf("failed to create database directory %s: %w", dir, err)
+	}
+
+	return nil
+}
+
 // initDatabase initializes the database with schema
 func initDatabase(dbPath string) (*Database, error) {
+	if err := ensureDatabaseDir(dbPath); err != nil {
+		return nil, err
+	}
+
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+
+	// sql.Open is lazy, so ping here to attribute open failures to the file
+	// rather than to whichever statement happens to run first.
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to open database %s: %w", dbPath, err)
 	}
 
 	// Enable foreign keys
