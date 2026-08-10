@@ -66,6 +66,8 @@ func NewAPIServer(db *Database, cfg *Config, worker *SyncWorker, listenAddr stri
 	mux.HandleFunc("/api/activity", api.handleGetActivity)
 	mux.HandleFunc("/api/waypoints", api.handleGetWaypoints)
 	mux.HandleFunc("/api/waypoints/", api.handleWaypointRoutes)
+	mux.HandleFunc("/api/range", api.handleGetRange)
+	mux.HandleFunc("/api/range/overlap", api.handleGetRangeOverlap)
 	mux.HandleFunc("/api/events", api.handleEvents)
 	mux.HandleFunc("/api/sync", api.handleSync)
 	mux.HandleFunc("/health", api.handleHealth)
@@ -837,6 +839,204 @@ func (a *APIServer) handleRenameWaypoint(w http.ResponseWriter, r *http.Request,
 		"id":   id,
 		"name": name,
 	})
+}
+
+// RangeResponse represents the /api/range response: KDE utilization
+// distribution contours for one tracker over a period (issue #3).
+type RangeResponse struct {
+	TrackerID  int            `json:"tracker_id"`
+	Month      string         `json:"month"` // YYYY-MM when a calendar month was requested
+	From       time.Time      `json:"from"`
+	To         time.Time      `json:"to"`
+	BandwidthM float64        `json:"bandwidth_m"`
+	FixesUsed  int            `json:"fixes_used"`
+	Core       [][][2]float64 `json:"core"` // 50% isopleth rings of [lon,lat]
+	Home       [][][2]float64 `json:"home"` // 95% isopleth rings of [lon,lat]
+}
+
+// OverlapPoint is one month of the cat-vs-cat territory overlap series.
+type OverlapPoint struct {
+	Month  string   `json:"month"` // YYYY-MM
+	Index  *float64 `json:"index"` // Bhattacharyya affinity; null when either cat lacks fixes
+	FixesA int      `json:"fixes_a"`
+	FixesB int      `json:"fixes_b"`
+}
+
+// parseRangeWindow resolves the period for /api/range: an explicit
+// month=YYYY-MM (calendar month in the activity timezone) wins; otherwise
+// from/to RFC3339; otherwise a rolling 30 days. The end is exclusive.
+func (a *APIServer) parseRangeWindow(w http.ResponseWriter, r *http.Request) (from, to time.Time, month string, ok bool) {
+	query := r.URL.Query()
+	loc := a.activityLocation()
+
+	if monthStr := query.Get("month"); monthStr != "" {
+		parsed, err := time.Parse("2006-01", monthStr)
+		if err != nil {
+			a.writeError(w, http.StatusBadRequest, "Invalid month format (use YYYY-MM)")
+			return from, to, "", false
+		}
+		from = time.Date(parsed.Year(), parsed.Month(), 1, 0, 0, 0, 0, loc)
+		return from, from.AddDate(0, 1, 0), monthStr, true
+	}
+
+	if fromStr := query.Get("from"); fromStr != "" {
+		var err error
+		from, err = time.Parse(time.RFC3339, fromStr)
+		if err != nil {
+			a.writeError(w, http.StatusBadRequest, "Invalid from date format (use RFC3339)")
+			return from, to, "", false
+		}
+		if toStr := query.Get("to"); toStr != "" {
+			to, err = time.Parse(time.RFC3339, toStr)
+			if err != nil {
+				a.writeError(w, http.StatusBadRequest, "Invalid to date format (use RFC3339)")
+				return from, to, "", false
+			}
+		} else {
+			to = time.Now()
+		}
+		return from, to, "", true
+	}
+
+	to = time.Now()
+	return to.AddDate(0, 0, -30), to, "", true
+}
+
+// handleGetRange handles GET /api/range?tracker_id=&month=YYYY-MM (or
+// from/to) - KDE 50% core-range and 95% home-range contours.
+func (a *APIServer) handleGetRange(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		a.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	trackerID, err := strconv.Atoi(r.URL.Query().Get("tracker_id"))
+	if err != nil || trackerID <= 0 {
+		a.writeError(w, http.StatusBadRequest, "Invalid or missing tracker_id")
+		return
+	}
+
+	exists, err := a.db.TrackerExists(trackerID)
+	if err != nil {
+		a.logger.Error("Failed to check tracker existence", "tracker_id", trackerID, "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Database error")
+		return
+	}
+	if !exists {
+		a.writeError(w, http.StatusNotFound, "Tracker not found")
+		return
+	}
+
+	from, to, month, ok := a.parseRangeWindow(w, r)
+	if !ok {
+		return
+	}
+
+	est, err := a.db.computeRange(trackerID, from, to)
+	if err != nil {
+		a.logger.Error("Failed to compute range", "tracker_id", trackerID, "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Failed to compute range")
+		return
+	}
+
+	a.writeJSON(w, http.StatusOK, RangeResponse{
+		TrackerID:  trackerID,
+		Month:      month,
+		From:       from,
+		To:         to,
+		BandwidthM: est.BandwidthM,
+		FixesUsed:  est.FixesUsed,
+		Core:       est.Core,
+		Home:       est.Home,
+	})
+}
+
+// handleGetRangeOverlap handles GET /api/range/overlap?months=12 - the
+// monthly Bhattacharyya overlap index between the first two trackers' KDEs,
+// oldest month first. Months where either cat has too few gated fixes report
+// a null index.
+func (a *APIServer) handleGetRangeOverlap(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		a.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	months := 12
+	if mStr := r.URL.Query().Get("months"); mStr != "" {
+		if m, err := strconv.Atoi(mStr); err == nil && m >= 1 && m <= 36 {
+			months = m
+		}
+	}
+
+	trackers, err := a.db.GetAllTrackers()
+	if err != nil {
+		a.logger.Error("Failed to get trackers", "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Failed to retrieve trackers")
+		return
+	}
+
+	series := []OverlapPoint{}
+	if len(trackers) < 2 {
+		a.writeJSON(w, http.StatusOK, series)
+		return
+	}
+	idA, idB := trackers[0].ID, trackers[1].ID
+
+	loc := a.activityLocation()
+	now := time.Now().In(loc)
+	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, loc).AddDate(0, -(months - 1), 0)
+
+	// One bounded fetch per cat covering the whole series; bucket by month.
+	posA, err := a.db.GetPositionsForRange(idA, monthStart, time.Time{})
+	if err != nil {
+		a.logger.Error("Failed to get positions for overlap", "tracker_id", idA, "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Failed to retrieve positions")
+		return
+	}
+	posB, err := a.db.GetPositionsForRange(idB, monthStart, time.Time{})
+	if err != nil {
+		a.logger.Error("Failed to get positions for overlap", "tracker_id", idB, "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Failed to retrieve positions")
+		return
+	}
+
+	bucket := func(positions []DwellPosition, from, to time.Time) []DwellPosition {
+		var out []DwellPosition
+		for _, p := range positions {
+			if !p.Timestamp.Before(from) && p.Timestamp.Before(to) {
+				out = append(out, p)
+			}
+		}
+		return out
+	}
+
+	for i := 0; i < months; i++ {
+		from := monthStart.AddDate(0, i, 0)
+		to := from.AddDate(0, 1, 0)
+		mA := bucket(posA, from, to)
+		mB := bucket(posB, from, to)
+
+		gatedA, gatedB := 0, 0
+		if len(mA) > 0 {
+			_, gatedA = centroidProjection(mA)
+		}
+		if len(mB) > 0 {
+			_, gatedB = centroidProjection(mB)
+		}
+
+		point := OverlapPoint{
+			Month:  from.Format("2006-01"),
+			FixesA: gatedA,
+			FixesB: gatedB,
+		}
+		if gatedA >= kdeMinFixes && gatedB >= kdeMinFixes {
+			idx := overlapIndex(mA, mB)
+			point.Index = &idx
+		}
+		series = append(series, point)
+	}
+
+	a.writeJSON(w, http.StatusOK, series)
 }
 
 // HeatmapBin represents a single bin in the heatmap grid

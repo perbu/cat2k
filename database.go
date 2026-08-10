@@ -836,14 +836,26 @@ func (d *Database) SetWaypointName(id int64, name *string) error {
 // given time, ordered by timestamp, for dwell analysis (issue #2). Follows
 // GetPositionsForActivity's pattern; gating itself happens in dwell.go.
 func (d *Database) GetPositionsForDwell(trackerID int, since time.Time) ([]DwellPosition, error) {
+	return d.GetPositionsForRange(trackerID, since, time.Time{})
+}
+
+// GetPositionsForRange returns the same gate-eligible fields as
+// GetPositionsForDwell but bounded to [start, end) for monthly KDE windows
+// (issue #3). A zero end means "no upper bound". Gating happens in kde.go.
+func (d *Database) GetPositionsForRange(trackerID int, start, end time.Time) ([]DwellPosition, error) {
 	query := `
 		SELECT tracker_id, timestamp, latitude, longitude, valid_signal, type, radius
 		FROM positions
 		WHERE tracker_id = ? AND timestamp >= ?
-		ORDER BY timestamp
 	`
+	args := []interface{}{trackerID, start}
+	if !end.IsZero() {
+		query += " AND timestamp < ?"
+		args = append(args, end)
+	}
+	query += " ORDER BY timestamp"
 
-	rows, err := d.db.Query(query, trackerID, since)
+	rows, err := d.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}

@@ -228,7 +228,8 @@
             margin-top: 10px;
         }
 
-        .date-inputs input[type="date"] {
+        .date-inputs input[type="date"],
+        .range-month-input input[type="month"] {
             width: 100%;
             padding: 9px 11px;
             border: 1px solid var(--card-border);
@@ -239,9 +240,49 @@
             background: #fff;
         }
 
-        .date-inputs input[type="date"]:focus {
+        .date-inputs input[type="date"]:focus,
+        .range-month-input input[type="month"]:focus {
             outline: none;
             border-color: var(--ink);
+        }
+
+        /* ---------- Home range (KDE contours) ---------- */
+        .range-body {
+            margin-top: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .range-body.hidden { display: none; }
+
+        .range-cat-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .range-cat-row .cat-dot { width: 9px; height: 9px; }
+
+        .range-cat-name {
+            flex: 1;
+            font-size: 12.5px;
+            font-weight: 600;
+        }
+
+        .range-cat-row .toggle { margin-left: auto; }
+
+        #overlap-chart {
+            width: 100%;
+            height: 84px;
+            margin-top: 10px;
+            cursor: pointer;
+        }
+
+        .overlap-empty {
+            font-size: 11.5px;
+            color: var(--text-3);
+            margin-top: 8px;
         }
 
         /* ---------- Cat cards ---------- */
@@ -832,6 +873,37 @@
                         <span class="knob"></span>
                     </button>
                 </div>
+            </div>
+
+            <!-- Home range (KDE contours, issue #3) -->
+            <div class="heatmap-card">
+                <div class="heatmap-head">
+                    <div>
+                        <div class="card-title">Home range</div>
+                        <div class="card-sub">50% core &amp; 95% range contours</div>
+                    </div>
+                    <button class="toggle on" id="range-toggle" role="switch" aria-checked="true" aria-label="Show home range contours">
+                        <span class="knob"></span>
+                    </button>
+                </div>
+                <div class="range-body" id="range-body">
+                    <div class="range-month-input">
+                        <input type="month" id="range-month" aria-label="Range month">
+                    </div>
+                    <div id="range-cats"></div>
+                </div>
+            </div>
+
+            <!-- Territory overlap -->
+            <div class="heatmap-card" id="overlap-card">
+                <div class="heatmap-head">
+                    <div>
+                        <div class="card-title">Territory overlap</div>
+                        <div class="card-sub">Monthly KDE overlap index between the cats</div>
+                    </div>
+                </div>
+                <canvas id="overlap-chart"></canvas>
+                <div class="overlap-empty" id="overlap-empty" style="display:none">Needs two cats with GPS fixes in the same month.</div>
             </div>
 
             <!-- Top places -->

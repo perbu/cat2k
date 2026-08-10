@@ -88,6 +88,7 @@ SQLite operations using modernc.org/sqlite driver. Four tables:
 Key methods:
 - `GetLatestPositions()` - Returns most recent position per tracker (used by status page)
 - `GetPositionsForDwell()` - Gate-eligible fields for a tracker over a time range, ordered by timestamp
+- `GetPositionsForRange()` - Same gate-eligible fields bounded to [start, end) for monthly KDE windows (GetPositionsForDwell delegates to it)
 
 All position inserts use `ON CONFLICT(id) DO UPDATE` on the extended quality/presence columns (radius, pdop, wifi_zone_id, …) so a re-backfill backfills them into historical rows; the insert stays idempotent because position IDs are stable. A migration in initDatabase adds the columns to pre-existing databases.
 
@@ -100,6 +101,13 @@ Dwell-point waypoints and territory transition graph (issue #2):
 - `dbscanEpisodes()` clusters episode centroids (epsilon 20 m, minPoints 1, pure Go, O(n²))
 - `computeWaypoints()` aggregates clusters (dwell time, visits, hour-of-day histogram, last visit, share + previous-period share) and reconciles them with the `waypoints` table by centroid proximity (40 m match radius) so user names survive recomputation; unnamed waypoints get rank-based auto-labels ("Waypoint 1" = most dwelt)
 - Transitions between consecutive episodes in different clusters form the directed territory graph
+
+### kde.go
+KDE utilization distributions — 50% core range vs 95% home range contours (issue #3):
+- Gated `FixGPS` fixes only, weighted by `FixWeight(radius)`, projected to a local equirectangular plane (meters) around the data centroid; deterministic stride subsampling caps fixes at 20k per evaluation
+- Weighted Gaussian KDE on a 128×128 grid over the fix bounding box padded by 3 bandwidths; bandwidth = 2× median fix `radius` clamped to 10–50 m; evaluation only visits cells within 3 bandwidths of each fix
+- `isoplethThreshold()` finds the density where cumulative mass reaches 50%/95% (cells sorted by density descending); `contourRings()` extracts the isopleths with a compact marching-squares, chains segments into rings, simplifies with Douglas-Peucker, and emits GeoJSON-style `[lon,lat]` rings
+- `overlapIndex()` is the Bhattacharyya affinity between two cats' KDEs on a shared grid (`sum(sqrt(m1·m2))` over per-cell probability masses: 1 = identical, 0 = disjoint), computed per month for the overlap chart
 
 ### scheduler.go
 Cron-based scheduling using github.com/robfig/cron/v3. Runs sync jobs on configured schedule with graceful shutdown support.
@@ -119,6 +127,8 @@ HTTP API server providing:
 - `GET /api/waypoints?tracker_id=&days=` - Detected dwell-point waypoints with centroid, dwell time, share (+ previous period), visits, hour-of-day histogram, last visit, and name (stored or auto-label)
 - `GET /api/waypoints/transitions?tracker_id=&days=` - Directed territory-graph edges `{from, to, count, probability}`
 - `PUT /api/waypoints/{id}` - Assign or clear a waypoint's user name (JSON body `{"name": "..."}`)
+- `GET /api/range?tracker_id=&month=YYYY-MM` (or `from`/`to` RFC3339; default rolling 30d) - KDE 50% core and 95% home-range contour rings with `bandwidth_m` and `fixes_used`
+- `GET /api/range/overlap?months=12` - Monthly cat-vs-cat Bhattacharyya overlap series `[{month, index, fixes_a, fixes_b}]` (index null when either cat lacks fixes)
 - `POST /api/sync` - Manual upstream resync
 - `GET /api/events` - SSE stream notifying browsers when fresh data lands
 - `GET /health` - Health check endpoint
@@ -131,7 +141,11 @@ Leaflet map view: per-cat heatmaps, recent-movement trails, activity cat cards,
 plus the waypoint layer (markers sized by dwell share, per-cat accent colors,
 click for stats popup with rename), the toggleable transition-graph overlay
 (curved directed edges, width ∝ probability), and a "Top places" sidebar panel
-ranking waypoints by dwell share with a trend vs. the previous period.
+ranking waypoints by dwell share with a trend vs. the previous period. The
+"Home range" card adds the KDE contour layer (50% core = stronger fill, 95%
+home range = outline, per-cat accent colors and toggles) with a month picker,
+and the "Territory overlap" card charts the monthly overlap index — clicking a
+bar steps the contour layer to that month.
 
 ### web/status.html
 Radar-style status page showing:

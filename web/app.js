@@ -63,6 +63,14 @@ let waypointSettings = {
     places: true,              // waypoint markers on the map
     routes: false              // transition-graph overlay
 };
+let rangeByTracker = {};       // trackerId -> /api/range response
+let rangeLayers = {};          // trackerId -> L.layerGroup of contour polygons
+let rangeSettings = {
+    enabled: true,             // KDE contour layer on the map
+    cats: {},                  // trackerId -> bool (absent = on)
+    month: null                // YYYY-MM, initialized to the current month
+};
+let overlapSeries = [];        // /api/range/overlap response
 
 function paletteForIndex(idx) {
     return HEATMAP_PALETTES[idx % HEATMAP_PALETTES.length];
@@ -818,6 +826,166 @@ async function renameWaypoint(id) {
     }
 }
 
+// ----- Home range: KDE 50% core / 95% home-range contours (issue #3) -----
+
+// Convert API rings ([lon,lat] pairs, closed) to Leaflet latlng arrays.
+function ringsToLatLngs(rings) {
+    return (rings || []).map(ring => ring.map(([lon, lat]) => [lat, lon]));
+}
+
+// Draw one tracker's contour pair: 95% home range as a thin outline with a
+// faint fill, 50% core as a stronger fill in the cat's accent color. With two
+// cats enabled the translucent home fills blend where they overlap, which
+// reads as the shared territory — no polygon clipping needed.
+function renderRangeLayer(id) {
+    if (rangeLayers[id]) { map.removeLayer(rangeLayers[id]); delete rangeLayers[id]; }
+    if (!map || !rangeSettings.enabled || rangeSettings.cats[id] === false) return;
+
+    const data = rangeByTracker[id];
+    if (!data) return;
+    const accent = accentForIndex(trackerPaletteIndex(id)).color;
+
+    const group = L.layerGroup();
+    const home = ringsToLatLngs(data.home);
+    const core = ringsToLatLngs(data.core);
+    home.forEach(latlngs => {
+        L.polygon(latlngs, {
+            color: accent, weight: 2, opacity: 0.9,
+            fillColor: accent, fillOpacity: 0.07
+        }).addTo(group);
+    });
+    core.forEach(latlngs => {
+        L.polygon(latlngs, {
+            color: accent, weight: 1, opacity: 0.8,
+            fillColor: accent, fillOpacity: 0.35
+        }).addTo(group);
+    });
+
+    if (group.getLayers().length === 0) return;
+    const tracker = allTrackers.find(t => t.id === id);
+    group.bindTooltip(
+        `${tracker ? escapeHtml(tracker.name) : 'Tracker ' + id} · ${data.month || '30d'} · `
+        + `${data.fixes_used} fixes · bandwidth ${Math.round(data.bandwidth_m)} m`
+    );
+    group.addTo(map);
+    rangeLayers[id] = group;
+}
+
+function refreshRangeLayers() {
+    allTrackers.forEach(t => renderRangeLayer(t.id));
+}
+
+// Fetch the month's contours for every tracker and refresh the layers.
+// Swallows per-tracker errors — a cat without data just gets no contours.
+async function loadRanges() {
+    if (allTrackers.length === 0 || !rangeSettings.month) return;
+
+    await Promise.all(allTrackers.map(async t => {
+        try {
+            const res = await fetch(
+                `${API_BASE}/api/range?tracker_id=${t.id}&month=${rangeSettings.month}`);
+            rangeByTracker[t.id] = res.ok ? await res.json() : null;
+        } catch (err) {
+            console.error(`Failed to load range for tracker ${t.id}:`, err);
+            rangeByTracker[t.id] = null;
+        }
+        renderRangeLayer(t.id);
+    }));
+}
+
+// Per-cat toggle rows inside the range card, built once the roster is known.
+function renderRangeCatToggles() {
+    const container = document.getElementById('range-cats');
+    if (!container) return;
+
+    container.innerHTML = '';
+    [...allTrackers].sort((a, b) => a.id - b.id).forEach(t => {
+        const accent = accentForIndex(trackerPaletteIndex(t.id)).color;
+        const on = rangeSettings.cats[t.id] !== false;
+
+        const row = document.createElement('div');
+        row.className = 'range-cat-row';
+        row.innerHTML = `
+            <span class="cat-dot" style="background:${accent}"></span>
+            <span class="range-cat-name">${escapeHtml(t.name)}</span>
+            <button class="toggle${on ? ' on' : ''}" role="switch" aria-checked="${on}"
+                    aria-label="Show ${escapeHtml(t.name)}'s range contours">
+                <span class="knob"></span>
+            </button>`;
+        row.querySelector('.toggle').addEventListener('click', (e) => {
+            const btn = e.currentTarget;
+            const nowOn = rangeSettings.cats[t.id] === false;
+            rangeSettings.cats[t.id] = nowOn;
+            btn.classList.toggle('on', nowOn);
+            btn.setAttribute('aria-checked', String(nowOn));
+            renderRangeLayer(t.id);
+        });
+        container.appendChild(row);
+    });
+}
+
+// Fetch the monthly cat-vs-cat overlap series and draw the chart.
+async function loadOverlap() {
+    try {
+        const res = await fetch(`${API_BASE}/api/range/overlap?months=12`);
+        overlapSeries = res.ok ? await res.json() : [];
+    } catch (err) {
+        console.error('Failed to load overlap series:', err);
+        overlapSeries = [];
+    }
+    drawOverlapChart();
+}
+
+// Bar chart of the monthly overlap index (0-1). The selected month is inked;
+// clicking a bar steps the range layer to that month.
+function drawOverlapChart() {
+    const canvas = document.getElementById('overlap-chart');
+    if (!canvas) return;
+    const empty = document.getElementById('overlap-empty');
+
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, w, h);
+
+    const points = overlapSeries || [];
+    if (empty) empty.style.display = points.some(p => p.index !== null) ? 'none' : 'block';
+    if (points.length === 0 || w === 0) return;
+
+    const gap = 3;
+    const barW = Math.max(2, (w - gap * (points.length - 1)) / points.length);
+    const baseline = h - 14; // room for month labels
+
+    points.forEach((p, i) => {
+        const x = i * (barW + gap);
+        const selected = p.month === rangeSettings.month;
+        if (p.index === null || p.index === undefined) {
+            // No usable month: tick mark at the baseline.
+            ctx.fillStyle = '#DFE3E7';
+            ctx.fillRect(x, baseline - 2, barW, 2);
+        } else {
+            const bh = Math.max(2, p.index * (baseline - 6));
+            ctx.fillStyle = selected ? '#16181D' : '#B4BAC2';
+            if (ctx.roundRect) {
+                ctx.beginPath();
+                ctx.roundRect(x, baseline - bh, barW, bh, 2);
+                ctx.fill();
+            } else {
+                ctx.fillRect(x, baseline - bh, barW, bh);
+            }
+        }
+        if (i % 3 === 0 || selected) {
+            ctx.fillStyle = selected ? '#16181D' : '#9198A2';
+            ctx.font = '9px "JetBrains Mono", monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText(p.month.slice(2), x + barW / 2, h - 3);
+        }
+    });
+}
+
 // Derive heat-map settings from the current map zoom and point density, used
 // when "Auto-tune" is on. Radius/blur are pixel values, so they track zoom;
 // intensity per point falls as the total point count rises, so dense ranges
@@ -1068,6 +1236,45 @@ function setupEventListeners() {
         });
     }
 
+    // Home-range layer toggle: re-render from cached contours, no refetch.
+    const rangeToggle = document.getElementById('range-toggle');
+    if (rangeToggle) {
+        rangeToggle.addEventListener('click', () => {
+            rangeSettings.enabled = !rangeSettings.enabled;
+            rangeToggle.classList.toggle('on', rangeSettings.enabled);
+            rangeToggle.setAttribute('aria-checked', String(rangeSettings.enabled));
+            refreshRangeLayers();
+        });
+    }
+
+    // Month picker: step the contour layer (and chart highlight) through
+    // monthly windows.
+    const monthInput = document.getElementById('range-month');
+    if (monthInput) {
+        monthInput.addEventListener('change', () => {
+            if (!monthInput.value) return;
+            rangeSettings.month = monthInput.value;
+            loadRanges();
+            drawOverlapChart();
+        });
+    }
+
+    // Click an overlap bar to step the range layer to that month.
+    const overlapChart = document.getElementById('overlap-chart');
+    if (overlapChart) {
+        overlapChart.addEventListener('click', (e) => {
+            if (overlapSeries.length === 0) return;
+            const rect = overlapChart.getBoundingClientRect();
+            const i = Math.floor((e.clientX - rect.left) / rect.width * overlapSeries.length);
+            const p = overlapSeries[Math.min(Math.max(i, 0), overlapSeries.length - 1)];
+            if (!p) return;
+            rangeSettings.month = p.month;
+            if (monthInput) monthInput.value = p.month;
+            loadRanges();
+            drawOverlapChart();
+        });
+    }
+
     // Heat map setting sliders — re-render with cached positions, no refetch.
     // Only active while Auto-tune is off (the group is inert otherwise).
     document.getElementById('intensity-slider').addEventListener('input', (e) => {
@@ -1100,6 +1307,8 @@ function initLiveUpdates() {
             loadAllTrackerData();
             loadActivity();
             loadWaypoints();
+            loadRanges();
+            loadOverlap();
         });
     } catch (err) {
         console.error('Live updates unavailable:', err);
@@ -1123,11 +1332,20 @@ async function init() {
 
         console.log(`Found ${allTrackers.length} tracker(s)`);
 
+        // Default the range month picker to the current (local) month.
+        const now = new Date();
+        rangeSettings.month = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+        const monthInput = document.getElementById('range-month');
+        if (monthInput) monthInput.value = rangeSettings.month;
+
         renderCatCards();   // identity/status skeleton before data arrives
+        renderRangeCatToggles();
         loadActivity();
         loadPOIs();
+        loadOverlap();
 
         await loadAllTrackerData();
+        loadRanges();
         initLiveUpdates();
 
     } catch (error) {
