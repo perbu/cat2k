@@ -70,6 +70,9 @@ func NewAPIServer(db *Database, cfg *Config, worker *SyncWorker, listenAddr stri
 	mux.HandleFunc("/api/range/overlap", api.handleGetRangeOverlap)
 	mux.HandleFunc("/api/presence", api.handleGetPresence)
 	mux.HandleFunc("/api/presence/excursions", api.handleGetExcursions)
+	mux.HandleFunc("/api/behavior/segments", api.handleGetBehaviorSegments)
+	mux.HandleFunc("/api/behavior/budget", api.handleGetBehaviorBudget)
+	mux.HandleFunc("/api/behavior/matrix", api.handleGetBehaviorMatrix)
 	mux.HandleFunc("/api/events", api.handleEvents)
 	mux.HandleFunc("/api/sync", api.handleSync)
 	mux.HandleFunc("/health", api.handleHealth)
@@ -1173,6 +1176,243 @@ func (a *APIServer) handleGetExcursions(w http.ResponseWriter, r *http.Request) 
 		Days:      days,
 		Stats:     computeExcursions(derivePresenceIntervals(fixes), a.activityLocation()),
 	})
+}
+
+// BehaviorStepJSON is one decoded 60s step for /api/behavior/segments:
+// endpoints and state, for state-colored tracks on the map (issue #5).
+type BehaviorStepJSON struct {
+	T     time.Time  `json:"t"`    // end-of-step timestamp
+	From  [2]float64 `json:"from"` // [lat, lon]
+	To    [2]float64 `json:"to"`   // [lat, lon]
+	State string     `json:"state"`
+	StepM float64    `json:"step_m"`
+}
+
+// BehaviorSegmentsResponse represents the /api/behavior/segments response.
+type BehaviorSegmentsResponse struct {
+	TrackerID  int                `json:"tracker_id"`
+	From       time.Time          `json:"from"`
+	To         time.Time          `json:"to"`
+	ModelReady bool               `json:"model_ready"`
+	Truncated  bool               `json:"truncated"` // true when only the most recent behaviorMaxSegSteps are returned
+	Steps      []BehaviorStepJSON `json:"steps"`
+}
+
+// BehaviorBudgetResponse represents the /api/behavior/budget response.
+type BehaviorBudgetResponse struct {
+	TrackerID  int                 `json:"tracker_id"`
+	Days       int                 `json:"days"`
+	ModelReady bool                `json:"model_ready"`
+	Budget     []BehaviorDayBudget `json:"budget"`
+}
+
+// BehaviorMatrixResponse represents the /api/behavior/matrix response: a
+// 24-row hour-of-day x state share matrix.
+type BehaviorMatrixResponse struct {
+	TrackerID  int            `json:"tracker_id"`
+	Days       int            `json:"days"`
+	ModelReady bool           `json:"model_ready"`
+	States     [3]string      `json:"states"`
+	Matrix     [24][3]float64 `json:"matrix"` // [hour][state] share of decoded step time
+}
+
+// handleGetBehaviorSegments handles GET
+// /api/behavior/segments?tracker_id=&from=&to= - time-ordered decoded steps
+// with positions and state, for track coloring. from/to are RFC3339 and
+// default to the last 24 hours. The payload is capped at behaviorMaxSegSteps
+// steps (most recent kept), mirroring the row cap in GetPositions.
+func (a *APIServer) handleGetBehaviorSegments(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		a.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	trackerID, err := strconv.Atoi(r.URL.Query().Get("tracker_id"))
+	if err != nil || trackerID <= 0 {
+		a.writeError(w, http.StatusBadRequest, "Invalid or missing tracker_id")
+		return
+	}
+	exists, err := a.db.TrackerExists(trackerID)
+	if err != nil {
+		a.logger.Error("Failed to check tracker existence", "tracker_id", trackerID, "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Database error")
+		return
+	}
+	if !exists {
+		a.writeError(w, http.StatusNotFound, "Tracker not found")
+		return
+	}
+
+	query := r.URL.Query()
+	to := time.Now()
+	if toStr := query.Get("to"); toStr != "" {
+		to, err = time.Parse(time.RFC3339, toStr)
+		if err != nil {
+			a.writeError(w, http.StatusBadRequest, "Invalid to date format (use RFC3339)")
+			return
+		}
+	}
+	from := to.Add(-24 * time.Hour)
+	if fromStr := query.Get("from"); fromStr != "" {
+		from, err = time.Parse(time.RFC3339, fromStr)
+		if err != nil {
+			a.writeError(w, http.StatusBadRequest, "Invalid from date format (use RFC3339)")
+			return
+		}
+	}
+	if !from.Before(to) {
+		a.writeError(w, http.StatusBadRequest, "from must be before to")
+		return
+	}
+
+	resp := BehaviorSegmentsResponse{
+		TrackerID: trackerID,
+		From:      from,
+		To:        to,
+		Steps:     []BehaviorStepJSON{},
+	}
+
+	model, err := a.db.behaviorModel(trackerID)
+	if err != nil {
+		a.logger.Error("Failed to get behavior model", "tracker_id", trackerID, "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Failed to load behavior model")
+		return
+	}
+	if model == nil {
+		a.writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	resp.ModelReady = true
+
+	segs, decoded, err := a.db.decodeBehaviorWindow(trackerID, from, to, model)
+	if err != nil {
+		a.logger.Error("Failed to decode behavior", "tracker_id", trackerID, "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Failed to decode behavior")
+		return
+	}
+
+	total := countBehaviorSteps(segs)
+	if total > behaviorMaxSegSteps {
+		resp.Truncated = true
+	}
+	kept := 0
+	for si, seg := range segs {
+		for t, s := range seg {
+			kept++
+			if total-kept >= behaviorMaxSegSteps {
+				continue // beyond the cap: keep only the most recent steps
+			}
+			resp.Steps = append(resp.Steps, BehaviorStepJSON{
+				T:     s.t,
+				From:  [2]float64{s.fromLat, s.fromLon},
+				To:    [2]float64{s.toLat, s.toLon},
+				State: behaviorStateNames[decoded[si][t]],
+				StepM: math.Round(s.stepM*10) / 10,
+			})
+		}
+	}
+
+	a.writeJSON(w, http.StatusOK, resp)
+}
+
+// handleGetBehaviorBudget handles GET /api/behavior/budget?tracker_id=&days=
+// - decoded hours per state per calendar day (stacked-bar data). Days default
+// to 7 and follow the same calendar-day convention as /api/presence.
+func (a *APIServer) handleGetBehaviorBudget(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		a.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	trackerID, days, ok := a.parsePresenceParams(w, r, 7, 90)
+	if !ok {
+		return
+	}
+
+	loc := a.activityLocation()
+	today := time.Now().In(loc)
+	startOfToday := time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, loc)
+	start := startOfToday.AddDate(0, 0, -(days - 1))
+
+	dates := make([]string, days)
+	for i := 0; i < days; i++ {
+		dates[i] = start.AddDate(0, 0, i).Format("2006-01-02")
+	}
+
+	resp := BehaviorBudgetResponse{
+		TrackerID: trackerID,
+		Days:      days,
+		Budget:    make([]BehaviorDayBudget, len(dates)),
+	}
+	for i, d := range dates {
+		resp.Budget[i].Date = d
+	}
+
+	model, err := a.db.behaviorModel(trackerID)
+	if err != nil {
+		a.logger.Error("Failed to get behavior model", "tracker_id", trackerID, "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Failed to load behavior model")
+		return
+	}
+	if model == nil {
+		a.writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	resp.ModelReady = true
+
+	segs, decoded, err := a.db.decodeBehaviorWindow(trackerID, start, time.Now(), model)
+	if err != nil {
+		a.logger.Error("Failed to decode behavior", "tracker_id", trackerID, "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Failed to decode behavior")
+		return
+	}
+
+	resp.Budget = behaviorBudgetPerDay(segs, decoded, dates, loc)
+	a.writeJSON(w, http.StatusOK, resp)
+}
+
+// handleGetBehaviorMatrix handles GET /api/behavior/matrix?tracker_id=&days=
+// - the 24h x 3 state-share matrix (crepuscular-pattern heatmap data). Days
+// default to 30 for a stable daily-rhythm estimate.
+func (a *APIServer) handleGetBehaviorMatrix(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		a.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	trackerID, days, ok := a.parsePresenceParams(w, r, 30, 90)
+	if !ok {
+		return
+	}
+
+	resp := BehaviorMatrixResponse{
+		TrackerID: trackerID,
+		Days:      days,
+		States:    behaviorStateNames,
+	}
+
+	model, err := a.db.behaviorModel(trackerID)
+	if err != nil {
+		a.logger.Error("Failed to get behavior model", "tracker_id", trackerID, "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Failed to load behavior model")
+		return
+	}
+	if model == nil {
+		a.writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	resp.ModelReady = true
+
+	since := time.Now().AddDate(0, 0, -days)
+	segs, decoded, err := a.db.decodeBehaviorWindow(trackerID, since, time.Now(), model)
+	if err != nil {
+		a.logger.Error("Failed to decode behavior", "tracker_id", trackerID, "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Failed to decode behavior")
+		return
+	}
+
+	resp.Matrix = behaviorHourMatrix(segs, decoded, a.activityLocation())
+	a.writeJSON(w, http.StatusOK, resp)
 }
 
 // HeatmapBin represents a single bin in the heatmap grid

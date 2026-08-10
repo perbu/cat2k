@@ -79,11 +79,12 @@ Key methods:
 - `fetchAndStorePositions()` - Internal method that handles 24h chunking
 
 ### database.go
-SQLite operations using modernc.org/sqlite driver. Four tables:
+SQLite operations using modernc.org/sqlite driver. Five tables:
 - `trackers` - Tracker metadata with `last_sync_timestamp`
 - `positions` - GPS positions (idempotent inserts by position ID)
 - `sync_log` - Sync operation history
 - `waypoints` - Dwell-point waypoint identity + user-assigned names (issue #2); clustering itself is recomputed on demand, this table only makes names stick
+- `behavior_models` - Fitted HMM parameters per tracker as a JSON blob (issue #5); refit on demand when stale so request-time decoding never refits
 
 Key methods:
 - `GetLatestPositions()` - Returns most recent position per tracker (used by status page)
@@ -118,6 +119,14 @@ WiFi-zone at-home timeline and excursion stats (issue #4):
 - `currentPresence()` walks the stream backwards (bounded by `presenceLookbackDays`) to find the ongoing state and its run start for the status chip
 - WiFi-zone data is the single source of truth for presence state. The SureHub flap's inside/outside status is known-stale (owners often let the cats out themselves, so many exits have no flap event; a wrongly-"outside" flap state never self-corrects) and is display-only — a flap-derived "garden" state was considered and dropped for this reason
 
+### behavior.go
+HMM behavioral segmentation — rest / forage / transit (issue #5):
+- `resampleBehaviorSteps()` gates fixes (FixGPS only) into 60s slots (nearest fix within 30s of slot center) and derives steps between consecutive occupied slots; a missed slot or an impossible-speed jump (`activityMaxSpeedMS`) breaks the segment, so no step or turn ever spans a signal gap
+- 3-state HMM: gamma emissions on step length, von Mises (mu=0) on turning angle; turns are only used when both adjacent steps clear 5 m (below that heading is GPS jitter), so rest is identified by step length alone
+- `fitHMM()` runs Baum-Welch (scaled forward-backward, gamma moment-match and Banerjee kappa M-steps) on the trailing 60 days (max 30k most-recent steps, min 500); EM is seeded from step-length quantiles and `relabelHMM()` enforces the semantic ordering rest < forage < transit by mean step length AFTER fitting — never assume the initial ordering survives
+- Fitted params persist as JSON in `behavior_models`; `behaviorModel()` refits on demand when the model is missing or older than 7 days (stale model keeps serving if a refit lacks data; no model at all → endpoints report `model_ready: false`)
+- `viterbiHMM()` decodes request windows against the stored params; every step counts 60s of its state for the per-day budget and hour-of-day share matrix
+
 ### scheduler.go
 Cron-based scheduling using github.com/robfig/cron/v3. Runs sync jobs on configured schedule with graceful shutdown support.
 
@@ -140,6 +149,9 @@ HTTP API server providing:
 - `GET /api/range/overlap?months=12` - Monthly cat-vs-cat Bhattacharyya overlap series `[{month, index, fixes_a, fixes_b}]` (index null when either cat lacks fixes)
 - `GET /api/presence?tracker_id=&days=7` - WiFi-zone presence timeline: per-day `{start, end, state}` intervals (home/away) clipped to the day plus `{time_home_s, excursions, longest_excursion_s}` summaries
 - `GET /api/presence/excursions?tracker_id=&days=30` - Excursion list with duration histogram (`duration_bucket_s` edges + `duration_counts`) and `departure_hours` histogram
+- `GET /api/behavior/segments?tracker_id=&from=&to=` (RFC3339, default last 24h) - Viterbi-decoded 60s steps `{t, from, to, state, step_m}` for state-colored tracks; capped at 10000 steps (most recent kept, `truncated` flag), `model_ready: false` when no HMM could be fitted yet
+- `GET /api/behavior/budget?tracker_id=&days=7` - Per-day decoded seconds per state (`rest_s`/`forage_s`/`transit_s`) for stacked-bar budgets
+- `GET /api/behavior/matrix?tracker_id=&days=30` - 24×3 hour-of-day × state share matrix
 - `POST /api/sync` - Manual upstream resync
 - `GET /api/events` - SSE stream notifying browsers when fresh data lands
 - `GET /health` - Health check endpoint
@@ -159,6 +171,11 @@ and the "Territory overlap" card charts the monthly overlap index — clicking a
 bar steps the contour layer to that month. The "At home" card stacks a 24h
 presence ribbon per day (home/away/no-data segments) for the last week, and
 the "Excursions" card shows per-cat duration and departure-hour histograms.
+The "Behavior" card (issue #5) toggles state-colored tracks on the map
+(blue rest / amber forage / red transit, straight segments so state
+boundaries stay exact) and shows the per-cat "Activity budget" (stacked
+state-share column per day, last 7 days) and "State by hour" (24 stacked
+micro-bars of state share per hour of day, last 30 days).
 
 ### web/status.html
 Radar-style status page showing:

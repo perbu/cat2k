@@ -420,6 +420,96 @@
             margin-top: 2px;
         }
 
+        /* ---------- Behavior segmentation (issue #5) ---------- */
+        .bh-cat { margin-top: 12px; }
+
+        .bh-cat-head {
+            display: flex;
+            align-items: baseline;
+            gap: 8px;
+        }
+
+        .bh-cat-head .cat-dot { width: 9px; height: 9px; align-self: center; }
+
+        .bh-cat-name {
+            flex: 1;
+            font-size: 12.5px;
+            font-weight: 600;
+        }
+
+        .bh-cat-summary { font-size: 11px; color: var(--text-3); }
+
+        .bh-sub {
+            font-size: 10px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--text-3);
+            margin-top: 10px;
+        }
+
+        .bh-cols {
+            display: flex;
+            align-items: flex-end;
+            gap: 5px;
+            height: 56px;
+            margin-top: 4px;
+        }
+
+        .bh-col {
+            flex: 1;
+            display: flex;
+            flex-direction: column-reverse; /* rest at the bottom, transit on top */
+            height: 100%;
+            border-radius: 3px;
+            overflow: hidden;
+            background: var(--seg-track);
+        }
+
+        .bh-col > div { width: 100%; }
+
+        .bh-collabels {
+            display: flex;
+            gap: 5px;
+        }
+
+        .bh-collabels span {
+            flex: 1;
+            text-align: center;
+            font-size: 11px;
+            color: var(--text-4);
+        }
+
+        .bh-collabels span.today { font-weight: 700; }
+
+        .bh-hrow {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin: 1px 0;
+        }
+
+        .bh-hr {
+            width: 34px;
+            flex-shrink: 0;
+            text-align: right;
+            font-size: 9px;
+            color: var(--text-4);
+        }
+
+        .bh-hbar {
+            flex: 1;
+            display: flex;
+            height: 5px;
+            border-radius: 3px;
+            overflow: hidden;
+            background: var(--seg-track);
+        }
+
+        .bh-hbar > div { height: 100%; }
+
+        .bh-matrix { margin-top: 6px; }
+
         .panel-empty {
             font-size: 11.5px;
             color: var(--text-3);
@@ -1072,6 +1162,26 @@
                     </div>
                 </div>
                 <div id="excursion-charts"></div>
+            </div>
+
+            <!-- Behavior segmentation (HMM, issue #5) -->
+            <div class="heatmap-card" id="behavior-card">
+                <div class="heatmap-head">
+                    <div>
+                        <div class="card-title">Behavior</div>
+                        <div class="card-sub">Color tracks by rest / forage / transit</div>
+                    </div>
+                    <button class="toggle" id="behavior-toggle" role="switch" aria-checked="false" aria-label="Color tracks by behavior state">
+                        <span class="knob"></span>
+                    </button>
+                </div>
+                <div id="behavior-budget"></div>
+                <div id="behavior-matrix"></div>
+                <div class="presence-legend">
+                    <span><span class="legend-swatch" style="background:#3B82F6"></span>Rest</span>
+                    <span><span class="legend-swatch" style="background:#F59E0B"></span>Forage</span>
+                    <span><span class="legend-swatch" style="background:#EF4444"></span>Transit</span>
+                </div>
             </div>
 
             <!-- Top places -->

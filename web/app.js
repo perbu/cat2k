@@ -73,6 +73,13 @@ let rangeSettings = {
 let overlapSeries = [];        // /api/range/overlap response
 let presenceByTracker = {};    // trackerId -> /api/presence response
 let excursionsByTracker = {};  // trackerId -> /api/presence/excursions .stats
+let behaviorSegByTracker = {};   // trackerId -> /api/behavior/segments response
+let behaviorBudgetByTracker = {}; // trackerId -> /api/behavior/budget response
+let behaviorMatrixByTracker = {}; // trackerId -> /api/behavior/matrix response
+let behaviorLayers = {};         // trackerId -> L.layerGroup of state-colored steps
+let behaviorSettings = {
+    tracks: false                // color tracks by rest/forage/transit state
+};
 
 function paletteForIndex(idx) {
     return HEATMAP_PALETTES[idx % HEATMAP_PALETTES.length];
@@ -1144,6 +1151,167 @@ function renderExcursionStats() {
     container.innerHTML = sections || '<div class="panel-empty">No excursions recorded.</div>';
 }
 
+// ----- Behavior: HMM rest/forage/transit segmentation (issue #5) -----
+
+// Semantic state colors, shared by the track layer, budget bars, hour matrix,
+// and the card legend. Order matters: budget columns stack rest at the
+// bottom, transit on top.
+const BEHAVIOR_STATES = ['rest', 'forage', 'transit'];
+const BEHAVIOR_STATE_COLORS = { rest: '#3B82F6', forage: '#F59E0B', transit: '#EF4444' };
+const BUDGET_DAYS = 7;
+const BEHAVIOR_MATRIX_DAYS = 30;
+
+// Fetch decoded segments (current date range), the daily budget, and the
+// hour matrix for every tracker, then re-render the layer and both panels.
+// Swallows per-tracker errors — a cat without a fitted model (too little
+// data) just gets no behavior visualizations.
+async function loadBehavior() {
+    if (allTrackers.length === 0) return;
+    const range = getDateRange();
+    const win = new URLSearchParams({ from: range.start.toISOString(), to: range.end.toISOString() });
+
+    await Promise.all(allTrackers.map(async t => {
+        try {
+            const [segRes, budRes, matRes] = await Promise.all([
+                fetch(`${API_BASE}/api/behavior/segments?tracker_id=${t.id}&${win}`)
+                    .then(r => r.ok ? r.json() : null),
+                fetch(`${API_BASE}/api/behavior/budget?tracker_id=${t.id}&days=${BUDGET_DAYS}`)
+                    .then(r => r.ok ? r.json() : null),
+                fetch(`${API_BASE}/api/behavior/matrix?tracker_id=${t.id}&days=${BEHAVIOR_MATRIX_DAYS}`)
+                    .then(r => r.ok ? r.json() : null)
+            ]);
+            behaviorSegByTracker[t.id] = segRes;
+            behaviorBudgetByTracker[t.id] = budRes;
+            behaviorMatrixByTracker[t.id] = matRes;
+            renderBehaviorLayer(t.id);
+        } catch (err) {
+            console.error(`Failed to load behavior for tracker ${t.id}:`, err);
+        }
+    }));
+
+    renderBehaviorBudget();
+    renderBehaviorMatrix();
+}
+
+// Draw one tracker's decoded steps as straight segments colored by state.
+// Straight lines, not splines: each step has its own state, so the segment
+// boundaries must stay exactly on the decoded steps.
+function renderBehaviorLayer(id) {
+    if (behaviorLayers[id]) { map.removeLayer(behaviorLayers[id]); delete behaviorLayers[id]; }
+    if (!map || !behaviorSettings.tracks) return;
+
+    const steps = behaviorSegByTracker[id]?.steps || [];
+    if (steps.length === 0) return;
+
+    const group = L.layerGroup();
+    steps.forEach(s => {
+        L.polyline([s.from, s.to], {
+            color: BEHAVIOR_STATE_COLORS[s.state] || '#9198A2',
+            weight: 3.5,
+            opacity: 0.9,
+            lineCap: 'round'
+        }).addTo(group).bindTooltip(
+            `${s.state} · ${formatDistance(s.step_m)} · ${new Date(s.t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+        );
+    });
+    group.addTo(map);
+    behaviorLayers[id] = group;
+}
+
+function refreshBehaviorLayers() {
+    allTrackers.forEach(t => renderBehaviorLayer(t.id));
+}
+
+// "Activity budget" panel: per cat, one full-height stacked column per day —
+// the share of decoded time in each state (rest bottom, transit top). The
+// hover title carries absolute hours; empty track means no decoded steps that
+// day (the cat was home on WiFi-zone fixes, or the collar was off).
+function renderBehaviorBudget() {
+    const container = document.getElementById('behavior-budget');
+    if (!container) return;
+
+    const roster = [...allTrackers].sort((a, b) => a.id - b.id);
+    const dayLabel = (date) => new Date(date + 'T00:00:00')
+        .toLocaleDateString(undefined, { weekday: 'short' });
+
+    const sections = roster.map(t => {
+        const days = behaviorBudgetByTracker[t.id]?.budget || [];
+        if (days.length === 0) return '';
+        const accent = accentForIndex(trackerPaletteIndex(t.id)).color;
+
+        const cols = days.map((d, i) => {
+            const total = d.rest_s + d.forage_s + d.transit_s;
+            const title = total > 0
+                ? `${d.date} — rest ${formatDurationS(d.rest_s)} · forage ${formatDurationS(d.forage_s)} · transit ${formatDurationS(d.transit_s)}`
+                : `${d.date} — no decoded steps`;
+            const segs = total > 0
+                ? BEHAVIOR_STATES.map(s =>
+                    `<div style="height:${d[s + '_s'] / total * 100}%;background:${BEHAVIOR_STATE_COLORS[s]}"></div>`
+                ).join('')
+                : '';
+            return `<div class="bh-col" title="${title}">${segs}</div>`;
+        }).join('');
+
+        const labels = days.map((d, i) => {
+            const isToday = i === days.length - 1;
+            return `<span class="${isToday ? 'today' : ''}">${isToday ? 'Today' : dayLabel(d.date)}</span>`;
+        }).join('');
+
+        return `<div class="bh-cat">
+            <div class="bh-cat-head">
+                <span class="cat-dot" style="background:${accent}"></span>
+                <span class="bh-cat-name">${escapeHtml(t.name)}</span>
+            </div>
+            <div class="bh-cols">${cols}</div>
+            <div class="bh-collabels">${labels}</div>
+        </div>`;
+    }).filter(Boolean).join('');
+
+    container.innerHTML = sections
+        ? `<div class="bh-sub">Activity budget · ${BUDGET_DAYS}d</div>${sections}`
+        : '<div class="panel-empty">No behavior model yet — needs more GPS history.</div>';
+}
+
+// "State by hour" panel: per cat, 24 stacked micro-bars (one per hour of
+// day) showing the state share within that hour over the last 30 days — the
+// crepuscular rhythm view.
+function renderBehaviorMatrix() {
+    const container = document.getElementById('behavior-matrix');
+    if (!container) return;
+
+    const roster = [...allTrackers].sort((a, b) => a.id - b.id);
+
+    const sections = roster.map(t => {
+        const resp = behaviorMatrixByTracker[t.id];
+        if (!resp || !resp.model_ready) return '';
+        const matrix = resp.matrix || [];
+        const accent = accentForIndex(trackerPaletteIndex(t.id)).color;
+
+        const rows = matrix.map((shares, h) => {
+            const total = (shares || []).reduce((a, b) => a + b, 0);
+            const segs = total > 0
+                ? BEHAVIOR_STATES.map((s, i) =>
+                    `<div style="width:${shares[i] * 100}%;background:${BEHAVIOR_STATE_COLORS[s]}" title="${h}:00 — ${s} ${Math.round(shares[i] * 100)}%"></div>`
+                ).join('')
+                : '';
+            const label = h % 6 === 0 ? String(h) : '';
+            return `<div class="bh-hrow"><span class="bh-hr mono">${label}</span><div class="bh-hbar">${segs}</div></div>`;
+        }).join('');
+
+        return `<div class="bh-cat">
+            <div class="bh-cat-head">
+                <span class="cat-dot" style="background:${accent}"></span>
+                <span class="bh-cat-name">${escapeHtml(t.name)}</span>
+            </div>
+            <div class="bh-matrix">${rows}</div>
+        </div>`;
+    }).filter(Boolean).join('');
+
+    container.innerHTML = sections
+        ? `<div class="bh-sub">State by hour · ${BEHAVIOR_MATRIX_DAYS}d</div>${sections}`
+        : '';
+}
+
 // Derive heat-map settings from the current map zoom and point density, used// when "Auto-tune" is on. Radius/blur are pixel values, so they track zoom;
 // intensity per point falls as the total point count rises, so dense ranges
 // don't wash out to solid colour. Mutates heatMapSettings and syncs the (view-
@@ -1278,6 +1446,7 @@ async function loadAllTrackerData() {
         renderCatCards();
         updateMeta();
         loadWaypoints();
+        loadBehavior();
 
         setLoading(false);
         applyAutoUIState();
@@ -1404,6 +1573,17 @@ function setupEventListeners() {
         });
     }
 
+    // Behavior track-coloring toggle: re-render from cached segments, no refetch.
+    const behaviorToggle = document.getElementById('behavior-toggle');
+    if (behaviorToggle) {
+        behaviorToggle.addEventListener('click', () => {
+            behaviorSettings.tracks = !behaviorSettings.tracks;
+            behaviorToggle.classList.toggle('on', behaviorSettings.tracks);
+            behaviorToggle.setAttribute('aria-checked', String(behaviorSettings.tracks));
+            refreshBehaviorLayers();
+        });
+    }
+
     // Month picker: step the contour layer (and chart highlight) through
     // monthly windows.
     const monthInput = document.getElementById('range-month');
@@ -1467,6 +1647,7 @@ function initLiveUpdates() {
             loadRanges();
             loadOverlap();
             loadPresence();
+            loadBehavior();
         });
     } catch (err) {
         console.error('Live updates unavailable:', err);

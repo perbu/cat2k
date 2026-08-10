@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -161,6 +162,18 @@ CREATE TABLE IF NOT EXISTS waypoints (
   name TEXT,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (tracker_id) REFERENCES trackers(id)
+);
+
+-- HMM behavior-segmentation models (issue #5). Baum-Welch fitting is too
+-- expensive per request, so fitted parameters persist here as a JSON blob
+-- (one row per tracker) and are refit on demand when stale; request-time
+-- Viterbi decoding always runs against the stored params.
+CREATE TABLE IF NOT EXISTS behavior_models (
+  tracker_id INTEGER PRIMARY KEY,
+  fitted_at DATETIME NOT NULL,
+  train_steps INTEGER NOT NULL,
+  params TEXT NOT NULL,
   FOREIGN KEY (tracker_id) REFERENCES trackers(id)
 );
 `
@@ -829,6 +842,55 @@ func (d *Database) SetWaypointName(id int64, name *string) error {
 		WHERE id = ?
 	`
 	_, err := d.db.Exec(query, name, id)
+	return err
+}
+
+// BehaviorModelRecord is a stored HMM behavior model (issue #5): fitted
+// parameters as JSON plus the provenance needed for staleness checks.
+type BehaviorModelRecord struct {
+	TrackerID  int
+	FittedAt   time.Time
+	TrainSteps int
+	Params     hmmParams
+}
+
+// GetBehaviorModel returns the stored HMM parameters for a tracker
+// (nil, nil when never fitted).
+func (d *Database) GetBehaviorModel(trackerID int) (*BehaviorModelRecord, error) {
+	query := `
+		SELECT tracker_id, fitted_at, train_steps, params
+		FROM behavior_models WHERE tracker_id = ?
+	`
+	var m BehaviorModelRecord
+	var raw string
+	err := d.db.QueryRow(query, trackerID).Scan(&m.TrackerID, &m.FittedAt, &m.TrainSteps, &raw)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal([]byte(raw), &m.Params); err != nil {
+		return nil, fmt.Errorf("failed to parse stored behavior model: %w", err)
+	}
+	return &m, nil
+}
+
+// SaveBehaviorModel upserts a tracker's freshly fitted HMM parameters.
+func (d *Database) SaveBehaviorModel(trackerID, trainSteps int, params *hmmParams) error {
+	raw, err := json.Marshal(params)
+	if err != nil {
+		return err
+	}
+	query := `
+		INSERT INTO behavior_models (tracker_id, fitted_at, train_steps, params)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(tracker_id) DO UPDATE SET
+			fitted_at = excluded.fitted_at,
+			train_steps = excluded.train_steps,
+			params = excluded.params
+	`
+	_, err = d.db.Exec(query, trackerID, time.Now(), trainSteps, string(raw))
 	return err
 }
 
