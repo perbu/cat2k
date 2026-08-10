@@ -71,6 +71,8 @@ let rangeSettings = {
     month: null                // YYYY-MM, initialized to the current month
 };
 let overlapSeries = [];        // /api/range/overlap response
+let presenceByTracker = {};    // trackerId -> /api/presence response
+let excursionsByTracker = {};  // trackerId -> /api/presence/excursions .stats
 
 function paletteForIndex(idx) {
     return HEATMAP_PALETTES[idx % HEATMAP_PALETTES.length];
@@ -986,8 +988,163 @@ function drawOverlapChart() {
     });
 }
 
-// Derive heat-map settings from the current map zoom and point density, used
-// when "Auto-tune" is on. Radius/blur are pixel values, so they track zoom;
+// ----- Presence: WiFi-zone at-home timeline + excursion stats (issue #4) -----
+
+const PRESENCE_DAYS = 7;
+const EXCURSION_DAYS = 30;
+
+// Semantic state colors. Ribbons are zone-only (home/away) — the WiFi zone is
+// the single source of truth; the SureHub flap state is known-stale and never
+// feeds presence state (see presence.go).
+const PRESENCE_STATE_COLORS = { home: '#17BE7E', away: '#E5484D' };
+
+// "3h 12m"-style formatting of a duration in seconds (presence summaries).
+function formatDurationS(sec) {
+    const mins = Math.round(sec / 60);
+    if (mins < 60) return `${mins}m`;
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return mins % 60 ? `${hours}h ${mins % 60}m` : `${hours}h`;
+    return `${Math.floor(hours / 24)}d ${hours % 24}h`;
+}
+
+// Upper-edge label for an excursion duration bucket ("5m", "2h").
+function excBucketLabel(edgeS) {
+    if (edgeS < 3600) return `${Math.round(edgeS / 60)}m`;
+    return `${Math.round(edgeS / 3600)}h`;
+}
+
+// Fetch the presence timeline and excursion stats for every tracker and
+// re-render both panels. Swallows per-tracker errors — a cat without zone
+// data just gets no ribbons.
+async function loadPresence() {
+    if (allTrackers.length === 0) return;
+
+    await Promise.all(allTrackers.map(async t => {
+        try {
+            const [pRes, eRes] = await Promise.all([
+                fetch(`${API_BASE}/api/presence?tracker_id=${t.id}&days=${PRESENCE_DAYS}`)
+                    .then(r => r.ok ? r.json() : null),
+                fetch(`${API_BASE}/api/presence/excursions?tracker_id=${t.id}&days=${EXCURSION_DAYS}`)
+                    .then(r => r.ok ? r.json() : null)
+            ]);
+            presenceByTracker[t.id] = pRes;
+            excursionsByTracker[t.id] = eRes ? eRes.stats : null;
+        } catch (err) {
+            console.error(`Failed to load presence for tracker ${t.id}:`, err);
+        }
+    }));
+
+    renderPresenceTimelines();
+    renderExcursionStats();
+}
+
+// One 24h ribbon per day stacked oldest→newest (today last), per cat. The
+// server clips intervals to the day, so segments always land inside the bar;
+// the bar's track color shows through where no zone data exists.
+function renderPresenceTimelines() {
+    const container = document.getElementById('presence-timelines');
+    if (!container) return;
+
+    const roster = [...allTrackers].sort((a, b) => a.id - b.id);
+    const timeOpt = { hour: '2-digit', minute: '2-digit' };
+
+    const sections = roster.map(t => {
+        const timeline = presenceByTracker[t.id]?.timeline || [];
+        if (timeline.length === 0) return '';
+        const accent = accentForIndex(trackerPaletteIndex(t.id)).color;
+
+        const rows = timeline.map((d, i) => {
+            const isToday = i === timeline.length - 1;
+            const dayStart = new Date(d.date + 'T00:00:00').getTime();
+            const segs = d.intervals.map(iv => {
+                const s = new Date(iv.start).getTime();
+                const e = new Date(iv.end).getTime();
+                const left = Math.max(0, (s - dayStart) / 864000);
+                const width = Math.max(0.4, (e - s) / 864000);
+                const color = PRESENCE_STATE_COLORS[iv.state] || '#B4BAC2';
+                const tip = `${iv.state} ${new Date(iv.start).toLocaleTimeString([], timeOpt)}`
+                    + ` – ${new Date(iv.end).toLocaleTimeString([], timeOpt)}`;
+                return `<div class="presence-seg" style="left:${left}%;width:${width}%;background:${color}" title="${tip}"></div>`;
+            }).join('');
+            const label = isToday ? 'Today'
+                : new Date(d.date + 'T00:00:00').toLocaleDateString(undefined, { weekday: 'short' });
+            return `<div class="presence-row${isToday ? ' today' : ''}">
+                <span class="presence-day">${label}</span>
+                <div class="presence-bar">${segs}</div>
+            </div>`;
+        }).join('');
+
+        const today = timeline[timeline.length - 1];
+        const summary = `home ${formatDurationS(today.time_home_s)} · ${today.excursions} excursion${today.excursions === 1 ? '' : 's'}`;
+
+        return `<div class="presence-cat">
+            <div class="presence-cat-head">
+                <span class="cat-dot" style="background:${accent}"></span>
+                <span class="presence-cat-name">${escapeHtml(t.name)}</span>
+                <span class="presence-today mono">${escapeHtml(summary)}</span>
+            </div>
+            ${rows}
+            <div class="presence-ticks"><span>0</span><span>6</span><span>12</span><span>18</span><span>24</span></div>
+        </div>`;
+    }).filter(Boolean).join('');
+
+    container.innerHTML = sections || '<div class="panel-empty">No WiFi-zone data yet.</div>';
+}
+
+// Excursion stats panel: per cat, a duration histogram (fixed buckets from
+// the API) and a departure-hour histogram — the daily rhythm at a glance.
+function renderExcursionStats() {
+    const container = document.getElementById('excursion-charts');
+    if (!container) return;
+
+    const roster = [...allTrackers].sort((a, b) => a.id - b.id);
+
+    const bars = (counts, accent, title) => {
+        const max = Math.max(1, ...counts);
+        return counts.map((c, i) =>
+            `<div class="exc-bar" title="${title(i)}: ${c}">
+                <div class="exc-bar-fill" style="height:${Math.max(5, c / max * 100)}%;background:${accent};opacity:${c > 0 ? 1 : 0.15}"></div>
+            </div>`
+        ).join('');
+    };
+
+    const sections = roster.map(t => {
+        const stats = excursionsByTracker[t.id];
+        if (!stats) return '';
+        const accent = accentForIndex(trackerPaletteIndex(t.id)).color;
+        const n = (stats.excursions || []).length;
+        if (n === 0) {
+            return `<div class="exc-head">
+                <span class="cat-dot" style="background:${accent}"></span>
+                <span class="exc-cat-name">${escapeHtml(t.name)}</span>
+                <span class="exc-summary">no excursions</span>
+            </div>`;
+        }
+
+        const longest = Math.max(...stats.excursions.map(e => e.duration_s));
+        const edges = stats.duration_bucket_s || [];
+        const bucketName = (i) => i === 0 ? `<${excBucketLabel(edges[0])}`
+            : i >= edges.length ? `${excBucketLabel(edges[edges.length - 1])}+`
+            : `≤${excBucketLabel(edges[i])}`;
+        const durLabels = stats.duration_counts.map((_, i) => `<span>${bucketName(i)}</span>`).join('');
+
+        return `<div class="exc-head">
+                <span class="cat-dot" style="background:${accent}"></span>
+                <span class="exc-cat-name">${escapeHtml(t.name)}</span>
+                <span class="exc-summary mono">${n} out · longest ${formatDurationS(longest)}</span>
+            </div>
+            <div class="exc-sub">Duration</div>
+            <div class="exc-bars">${bars(stats.duration_counts, accent, bucketName)}</div>
+            <div class="exc-labels">${durLabels}</div>
+            <div class="exc-sub">Departure</div>
+            <div class="exc-bars">${bars(stats.departure_hours, accent, h => `${h}:00`)}</div>
+            <div class="exc-labels"><span>0</span><span>6</span><span>12</span><span>18</span><span>24</span></div>`;
+    }).filter(Boolean).join('');
+
+    container.innerHTML = sections || '<div class="panel-empty">No excursions recorded.</div>';
+}
+
+// Derive heat-map settings from the current map zoom and point density, used// when "Auto-tune" is on. Radius/blur are pixel values, so they track zoom;
 // intensity per point falls as the total point count rises, so dense ranges
 // don't wash out to solid colour. Mutates heatMapSettings and syncs the (view-
 // only) slider UI so the numbers stay honest.
@@ -1309,6 +1466,7 @@ function initLiveUpdates() {
             loadWaypoints();
             loadRanges();
             loadOverlap();
+            loadPresence();
         });
     } catch (err) {
         console.error('Live updates unavailable:', err);
@@ -1343,6 +1501,7 @@ async function init() {
         loadActivity();
         loadPOIs();
         loadOverlap();
+        loadPresence();
 
         await loadAllTrackerData();
         loadRanges();

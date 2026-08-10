@@ -285,6 +285,147 @@
             margin-top: 8px;
         }
 
+        /* ---------- Presence timeline & excursions (issue #4) ---------- */
+        .presence-cat { margin-top: 12px; }
+
+        .presence-cat-head {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 6px;
+        }
+
+        .presence-cat-head .cat-dot { width: 9px; height: 9px; }
+
+        .presence-cat-name {
+            flex: 1;
+            font-size: 12.5px;
+            font-weight: 600;
+        }
+
+        .presence-today {
+            font-size: 11px;
+            color: var(--text-3);
+        }
+
+        .presence-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin: 3px 0;
+        }
+
+        .presence-day {
+            width: 34px;
+            flex-shrink: 0;
+            font-size: 10.5px;
+            color: var(--text-3);
+        }
+
+        .presence-row.today .presence-day { font-weight: 700; color: var(--text-2); }
+
+        .presence-bar {
+            position: relative;
+            flex: 1;
+            height: 10px;
+            border-radius: 5px;
+            background: var(--seg-track);
+            overflow: hidden;
+        }
+
+        .presence-seg {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            min-width: 1px;
+        }
+
+        .presence-ticks {
+            display: flex;
+            justify-content: space-between;
+            font-size: 9px;
+            color: var(--text-4);
+            margin: 2px 0 0 42px;
+        }
+
+        .presence-legend {
+            display: flex;
+            gap: 14px;
+            margin-top: 12px;
+            font-size: 11px;
+            color: var(--text-2);
+        }
+
+        .legend-swatch {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 2px;
+            margin-right: 5px;
+        }
+
+        .exc-head {
+            display: flex;
+            align-items: baseline;
+            gap: 8px;
+            margin-top: 12px;
+        }
+
+        .exc-head .cat-dot { width: 9px; height: 9px; align-self: center; }
+
+        .exc-cat-name {
+            flex: 1;
+            font-size: 12.5px;
+            font-weight: 600;
+        }
+
+        .exc-summary { font-size: 11px; color: var(--text-3); }
+
+        .exc-sub {
+            font-size: 10px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--text-3);
+            margin-top: 10px;
+        }
+
+        .exc-bars {
+            display: flex;
+            align-items: flex-end;
+            gap: 2px;
+            height: 40px;
+            margin-top: 4px;
+        }
+
+        .exc-bar {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-end;
+            height: 100%;
+        }
+
+        .exc-bar-fill {
+            width: 100%;
+            border-radius: 2px;
+            min-height: 2px;
+        }
+
+        .exc-labels {
+            display: flex;
+            justify-content: space-between;
+            font-size: 9px;
+            color: var(--text-4);
+            margin-top: 2px;
+        }
+
+        .panel-empty {
+            font-size: 11.5px;
+            color: var(--text-3);
+            margin-top: 10px;
+        }
+
         /* ---------- Cat cards ---------- */
         #cat-cards {
             display: flex;
@@ -904,6 +1045,33 @@
                 </div>
                 <canvas id="overlap-chart"></canvas>
                 <div class="overlap-empty" id="overlap-empty" style="display:none">Needs two cats with GPS fixes in the same month.</div>
+            </div>
+
+            <!-- At-home timeline (WiFi-zone presence, issue #4) -->
+            <div class="heatmap-card" id="presence-card">
+                <div class="heatmap-head">
+                    <div>
+                        <div class="card-title">At home</div>
+                        <div class="card-sub">WiFi-zone presence, last 7 days</div>
+                    </div>
+                </div>
+                <div id="presence-timelines"></div>
+                <div class="presence-legend">
+                    <span><span class="legend-swatch" style="background:#17BE7E"></span>Home</span>
+                    <span><span class="legend-swatch" style="background:#E5484D"></span>Away</span>
+                    <span><span class="legend-swatch" style="background:#F0F2F4;border:1px solid #DFE3E7"></span>No data</span>
+                </div>
+            </div>
+
+            <!-- Excursion stats (issue #4) -->
+            <div class="heatmap-card" id="excursions-card">
+                <div class="heatmap-head">
+                    <div>
+                        <div class="card-title">Excursions</div>
+                        <div class="card-sub">Trips off the property, last 30 days</div>
+                    </div>
+                </div>
+                <div id="excursion-charts"></div>
             </div>
 
             <!-- Top places -->

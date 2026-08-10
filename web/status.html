@@ -233,6 +233,19 @@
 			color: #ff6b6b;
 		}
 
+		.presence-chip {
+			display: inline-block;
+			font-size: 0.7rem;
+			font-weight: 600;
+			letter-spacing: 0.04em;
+			margin-top: 8px;
+			padding: 3px 10px;
+			border-radius: 999px;
+		}
+
+		.presence-chip.home { background: rgba(0, 200, 150, 0.15); color: #00c896; }
+		.presence-chip.away { background: rgba(255, 107, 107, 0.15); color: #ff6b6b; }
+
 		.poi {
 			position: absolute;
 			transform: translate(-50%, -50%);
@@ -363,6 +376,19 @@
 			return 'battery-red';
 		}
 
+		// "2h 14m"-style duration from an ISO start time until now, for the
+		// presence chip ("out for 2h 14m").
+		function formatDurationSince(isoString) {
+			const seconds = Math.max(0, Math.floor((Date.now() - new Date(isoString).getTime()) / 1000));
+			const minutes = Math.floor(seconds / 60);
+			const hours = Math.floor(minutes / 60);
+			const days = Math.floor(hours / 24);
+			if (days > 0) return `${days}d ${hours % 24}h`;
+			if (hours > 0) return `${hours}h ${minutes % 60}m`;
+			if (minutes > 0) return `${minutes}m`;
+			return 'just now';
+		}
+
 		// Convert lat/lon to radar x/y coordinates (0-100 range for SVG viewBox)
 		function latLonToRadar(lat, lon) {
 			const distance = getDistance(homeCoords.lat, homeCoords.lon, lat, lon);
@@ -468,6 +494,7 @@
 				<p class="distance-dir">--m</p>
 				<p class="battery">Battery: <span>--</span></p>
 				<p class="last-update">Last GPS: <span>--</span></p>
+				<div><span class="presence-chip" style="display:none"></span></div>
 				<div class="flap-status"></div>
 			`;
 			return div;
@@ -509,6 +536,19 @@
 					batterySpan.className = '';
 				}
 				info.querySelector('.last-update span').textContent = timeAgo(tracker.timestamp);
+
+				// WiFi-zone presence chip (issue #4): home / away, with the
+				// away chip carrying the trip duration so far.
+				const chip = info.querySelector('.presence-chip');
+				if (tracker.presence) {
+					const p = tracker.presence;
+					const text = p.state === 'away' ? `out for ${formatDurationSince(p.since)}` : 'home';
+					chip.textContent = text;
+					chip.className = `presence-chip ${p.state}`;
+					chip.style.display = '';
+				} else {
+					chip.style.display = 'none';
+				}
 
 				// Update flap status if available
 				const flapStatus = info.querySelector('.flap-status');

@@ -109,6 +109,15 @@ KDE utilization distributions — 50% core range vs 95% home range contours (iss
 - `isoplethThreshold()` finds the density where cumulative mass reaches 50%/95% (cells sorted by density descending); `contourRings()` extracts the isopleths with a compact marching-squares, chains segments into rings, simplifies with Douglas-Peucker, and emits GeoJSON-style `[lon,lat]` rings
 - `overlapIndex()` is the Bhattacharyya affinity between two cats' KDEs on a shared grid (`sum(sqrt(m1·m2))` over per-cell probability masses: 1 = identical, 0 = disjoint), computed per month for the overlap chart
 
+### presence.go
+WiFi-zone at-home timeline and excursion stats (issue #4):
+- `zoneState()` classifies a fix: `wifi_zone_id != 0` = home (on the property), `wifi_zone_id == 0` or `wifi_zone_id_exited` set = away; NULL `wifi_zone_id` (pre-migration rows) is unknown — such fixes are skipped entirely and never fabricate state
+- `derivePresenceIntervals()` cuts an interval at every zone-state change; a silence over `presenceMaxGapS` (1h) between zone-known fixes closes the interval so it never spans a signal outage
+- `summarizePresenceDays()` clips intervals to calendar days (activity timezone) and summarizes each: `time_home_s`, excursion count (attributed to the departure day), `longest_excursion_s`
+- `computeExcursions()` aggregates away intervals: excursion list, fixed-bucket duration histogram (<5m … ≥8h), departure hour-of-day histogram
+- `currentPresence()` walks the stream backwards (bounded by `presenceLookbackDays`) to find the ongoing state and its run start for the status chip
+- WiFi-zone data is the single source of truth for presence state. The SureHub flap's inside/outside status is known-stale (owners often let the cats out themselves, so many exits have no flap event; a wrongly-"outside" flap state never self-corrects) and is display-only — a flap-derived "garden" state was considered and dropped for this reason
+
 ### scheduler.go
 Cron-based scheduling using github.com/robfig/cron/v3. Runs sync jobs on configured schedule with graceful shutdown support.
 
@@ -129,12 +138,14 @@ HTTP API server providing:
 - `PUT /api/waypoints/{id}` - Assign or clear a waypoint's user name (JSON body `{"name": "..."}`)
 - `GET /api/range?tracker_id=&month=YYYY-MM` (or `from`/`to` RFC3339; default rolling 30d) - KDE 50% core and 95% home-range contour rings with `bandwidth_m` and `fixes_used`
 - `GET /api/range/overlap?months=12` - Monthly cat-vs-cat Bhattacharyya overlap series `[{month, index, fixes_a, fixes_b}]` (index null when either cat lacks fixes)
+- `GET /api/presence?tracker_id=&days=7` - WiFi-zone presence timeline: per-day `{start, end, state}` intervals (home/away) clipped to the day plus `{time_home_s, excursions, longest_excursion_s}` summaries
+- `GET /api/presence/excursions?tracker_id=&days=30` - Excursion list with duration histogram (`duration_bucket_s` edges + `duration_counts`) and `departure_hours` histogram
 - `POST /api/sync` - Manual upstream resync
 - `GET /api/events` - SSE stream notifying browsers when fresh data lands
 - `GET /health` - Health check endpoint
 - Static file serving from `./web` directory
 
-The `/api/status` endpoint integrates with SureHub (github.com/perbu/go-sure) to fetch pet inside/outside status. Results are cached for 5 minutes to avoid excessive API calls.
+The `/api/status` endpoint integrates with SureHub (github.com/perbu/go-sure) to fetch pet inside/outside status. Results are cached for 5 minutes to avoid excessive API calls. It also adds a per-tracker `presence: {state, since}` chip (issue #4) derived from WiFi-zone data alone — the flap status stays display-only (see presence.go).
 
 ### web/index.html + web/app.js
 Leaflet map view: per-cat heatmaps, recent-movement trails, activity cat cards,
@@ -145,13 +156,16 @@ ranking waypoints by dwell share with a trend vs. the previous period. The
 "Home range" card adds the KDE contour layer (50% core = stronger fill, 95%
 home range = outline, per-cat accent colors and toggles) with a month picker,
 and the "Territory overlap" card charts the monthly overlap index — clicking a
-bar steps the contour layer to that month.
+bar steps the contour layer to that month. The "At home" card stacks a 24h
+presence ribbon per day (home/away/no-data segments) for the last week, and
+the "Excursions" card shows per-cat duration and departure-hour histograms.
 
 ### web/status.html
 Radar-style status page showing:
 - Trackers positioned relative to home on a 1km radius radar
 - Distance and bearing to each tracker
 - Battery percentage
+- WiFi-zone presence chip per cat ("home" / "out for 2h 14m")
 - Inside/outside status from SureHub pet flaps
 - Configurable POIs as markers
 - Auto-refreshes every 30 seconds

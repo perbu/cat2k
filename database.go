@@ -839,6 +839,45 @@ func (d *Database) GetPositionsForDwell(trackerID int, since time.Time) ([]Dwell
 	return d.GetPositionsForRange(trackerID, since, time.Time{})
 }
 
+// GetPositionsForPresence returns timestamps and WiFi-zone fields for a
+// tracker since a given time, ordered by timestamp, for presence analysis
+// (issue #4). NULL wifi_zone_id (pre-migration rows) stays a nil pointer;
+// presence.go treats it as "unknown", never as a state.
+func (d *Database) GetPositionsForPresence(trackerID int, since time.Time) ([]PresencePosition, error) {
+	query := `
+		SELECT timestamp, wifi_zone_id, wifi_zone_id_exited
+		FROM positions
+		WHERE tracker_id = ? AND timestamp >= ?
+		ORDER BY timestamp
+	`
+
+	rows, err := d.db.Query(query, trackerID, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var positions []PresencePosition
+	for rows.Next() {
+		var p PresencePosition
+		var zoneID, zoneExited sql.NullInt64
+		if err := rows.Scan(&p.Timestamp, &zoneID, &zoneExited); err != nil {
+			return nil, err
+		}
+		if zoneID.Valid {
+			z := int(zoneID.Int64)
+			p.WifiZoneID = &z
+		}
+		if zoneExited.Valid {
+			z := int(zoneExited.Int64)
+			p.WifiZoneIDExited = &z
+		}
+		positions = append(positions, p)
+	}
+
+	return positions, rows.Err()
+}
+
 // GetPositionsForRange returns the same gate-eligible fields as
 // GetPositionsForDwell but bounded to [start, end) for monthly KDE windows
 // (issue #3). A zero end means "no upper bound". Gating happens in kde.go.

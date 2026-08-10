@@ -68,6 +68,8 @@ func NewAPIServer(db *Database, cfg *Config, worker *SyncWorker, listenAddr stri
 	mux.HandleFunc("/api/waypoints/", api.handleWaypointRoutes)
 	mux.HandleFunc("/api/range", api.handleGetRange)
 	mux.HandleFunc("/api/range/overlap", api.handleGetRangeOverlap)
+	mux.HandleFunc("/api/presence", api.handleGetPresence)
+	mux.HandleFunc("/api/presence/excursions", api.handleGetExcursions)
 	mux.HandleFunc("/api/events", api.handleEvents)
 	mux.HandleFunc("/api/sync", api.handleSync)
 	mux.HandleFunc("/health", api.handleHealth)
@@ -419,16 +421,26 @@ type HistoryPoint struct {
 
 // TrackerStatus represents a tracker's current status for radar display
 type TrackerStatus struct {
-	ID        int            `json:"id"`
-	Name      string         `json:"name"`
-	Color     string         `json:"color"`
-	Lat       float64        `json:"lat"`
-	Lon       float64        `json:"lon"`
-	Battery   *int           `json:"battery,omitempty"`
-	Timestamp time.Time      `json:"timestamp"`
-	IsInside  *bool          `json:"is_inside,omitempty"` // From SureHub pet flap
-	LastFlap  *string        `json:"last_flap,omitempty"` // Time of last flap activity
-	History   []HistoryPoint `json:"history,omitempty"`   // Recent position history for trail
+	ID        int             `json:"id"`
+	Name      string          `json:"name"`
+	Color     string          `json:"color"`
+	Lat       float64         `json:"lat"`
+	Lon       float64         `json:"lon"`
+	Battery   *int            `json:"battery,omitempty"`
+	Timestamp time.Time       `json:"timestamp"`
+	IsInside  *bool           `json:"is_inside,omitempty"` // From SureHub pet flap
+	LastFlap  *string         `json:"last_flap,omitempty"` // Time of last flap activity
+	Presence  *PresenceStatus `json:"presence,omitempty"`  // WiFi-zone state (issue #4)
+	History   []HistoryPoint  `json:"history,omitempty"`   // Recent position history for trail
+}
+
+// PresenceStatus is the current WiFi-zone presence chip for /api/status
+// (issue #4). State comes from the collar's zone reporting alone; the SureHub
+// flap state is known-stale (manual let-outs, missed exits) and stays
+// display-only in is_inside/last_flap.
+type PresenceStatus struct {
+	State PresenceState `json:"state"`
+	Since time.Time     `json:"since"`
 }
 
 // Color palette for auto-assigning tracker colors
@@ -509,6 +521,16 @@ func (a *APIServer) handleGetStatus(w http.ResponseWriter, r *http.Request) {
 				formatted := status.lastFlap.Format(time.RFC3339)
 				tracker.LastFlap = &formatted
 			}
+		}
+
+		// Current WiFi-zone presence (issue #4). Zone data is authoritative;
+		// the flap status above is shown raw but never feeds this state
+		// (see presence.go for why).
+		presFixes, err := a.db.GetPositionsForPresence(p.TrackerID, time.Now().AddDate(0, 0, -presenceLookbackDays))
+		if err != nil {
+			a.logger.Error("Failed to get presence fixes", "tracker_id", p.TrackerID, "error", err)
+		} else if state, since, known := currentPresence(presFixes); known {
+			tracker.Presence = &PresenceStatus{State: state, Since: since}
 		}
 
 		resp.Trackers = append(resp.Trackers, tracker)
@@ -1037,6 +1059,120 @@ func (a *APIServer) handleGetRangeOverlap(w http.ResponseWriter, r *http.Request
 	}
 
 	a.writeJSON(w, http.StatusOK, series)
+}
+
+// PresenceResponse represents the /api/presence response: per-day zone-state
+// intervals plus daily summaries (issue #4).
+type PresenceResponse struct {
+	TrackerID int           `json:"tracker_id"`
+	Days      int           `json:"days"`
+	Timeline  []PresenceDay `json:"timeline"`
+}
+
+// ExcursionsResponse represents the /api/presence/excursions response.
+type ExcursionsResponse struct {
+	TrackerID int            `json:"tracker_id"`
+	Days      int            `json:"days"`
+	Stats     ExcursionStats `json:"stats"`
+}
+
+// parsePresenceParams extracts and validates the tracker_id and days query
+// parameters shared by the presence endpoints. Follows parseWaypointParams,
+// but with a caller-supplied default for days.
+func (a *APIServer) parsePresenceParams(w http.ResponseWriter, r *http.Request, defaultDays, maxDays int) (trackerID, days int, ok bool) {
+	trackerID, err := strconv.Atoi(r.URL.Query().Get("tracker_id"))
+	if err != nil || trackerID <= 0 {
+		a.writeError(w, http.StatusBadRequest, "Invalid or missing tracker_id")
+		return 0, 0, false
+	}
+
+	exists, err := a.db.TrackerExists(trackerID)
+	if err != nil {
+		a.logger.Error("Failed to check tracker existence", "tracker_id", trackerID, "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Database error")
+		return 0, 0, false
+	}
+	if !exists {
+		a.writeError(w, http.StatusNotFound, "Tracker not found")
+		return 0, 0, false
+	}
+
+	days = defaultDays
+	if daysStr := r.URL.Query().Get("days"); daysStr != "" {
+		if d, err := strconv.Atoi(daysStr); err == nil && d >= 1 && d <= maxDays {
+			days = d
+		}
+	}
+
+	return trackerID, days, true
+}
+
+// handleGetPresence handles GET /api/presence?tracker_id=&days=7 - the
+// WiFi-zone home/away timeline: per-day intervals (clipped to the day) plus
+// daily summaries (time at home, excursion count, longest excursion). Days
+// without zone-known fixes come back empty.
+func (a *APIServer) handleGetPresence(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		a.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	trackerID, days, ok := a.parsePresenceParams(w, r, 7, 90)
+	if !ok {
+		return
+	}
+
+	loc := a.activityLocation()
+	today := time.Now().In(loc)
+	startOfToday := time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, loc)
+	start := startOfToday.AddDate(0, 0, -(days - 1))
+
+	dates := make([]string, days)
+	for i := 0; i < days; i++ {
+		dates[i] = start.AddDate(0, 0, i).Format("2006-01-02")
+	}
+
+	fixes, err := a.db.GetPositionsForPresence(trackerID, start)
+	if err != nil {
+		a.logger.Error("Failed to get presence fixes", "tracker_id", trackerID, "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Failed to retrieve positions")
+		return
+	}
+
+	a.writeJSON(w, http.StatusOK, PresenceResponse{
+		TrackerID: trackerID,
+		Days:      days,
+		Timeline:  summarizePresenceDays(derivePresenceIntervals(fixes), dates, loc),
+	})
+}
+
+// handleGetExcursions handles GET /api/presence/excursions?tracker_id=&days=30
+// - the excursions (away intervals) of the period with duration and
+// departure-hour histograms for the stats panel.
+func (a *APIServer) handleGetExcursions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		a.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	trackerID, days, ok := a.parsePresenceParams(w, r, 30, 365)
+	if !ok {
+		return
+	}
+
+	since := time.Now().AddDate(0, 0, -days)
+	fixes, err := a.db.GetPositionsForPresence(trackerID, since)
+	if err != nil {
+		a.logger.Error("Failed to get presence fixes", "tracker_id", trackerID, "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Failed to retrieve positions")
+		return
+	}
+
+	a.writeJSON(w, http.StatusOK, ExcursionsResponse{
+		TrackerID: trackerID,
+		Days:      days,
+		Stats:     computeExcursions(derivePresenceIntervals(fixes), a.activityLocation()),
+	})
 }
 
 // HeatmapBin represents a single bin in the heatmap grid
