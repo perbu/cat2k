@@ -8,7 +8,7 @@ import (
 
 // Dwell-point waypoints and territory transitions (GitHub issue #2).
 //
-// Pipeline: gate fixes (only genuine GPS fixes — snapped CMD-X WiFi-zone fixes
+// Pipeline: gate fixes (only genuine GPS fixes — snapped WiFi-zone fixes
 // would fabricate a giant phantom waypoint at the zone center), group
 // consecutive stationary fixes into dwell episodes, cluster episode centroids
 // with a small pure-Go DBSCAN, then count transitions between consecutive
@@ -49,6 +49,7 @@ type DwellPosition struct {
 	Longitude   float64
 	ValidSignal *bool
 	Type        *string
+	WifiZoneID  *int
 	Radius      *int
 }
 
@@ -56,7 +57,7 @@ type DwellPosition struct {
 // GPS fixes pass: invalid fixes and snapped WiFi-zone fixes (FixHome) are
 // excluded per gate.go.
 func dwellGate(p DwellPosition) bool {
-	return ClassifyFix(p.ValidSignal, p.Type) == FixGPS
+	return ClassifyFix(p.ValidSignal, p.Type, p.WifiZoneID) == FixGPS
 }
 
 // dwellEpisode is one continuous stationary stay: the cat stayed within

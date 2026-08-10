@@ -334,7 +334,7 @@ func (d *Database) applyAlertState(trackerID int, kind string, firing bool, ev a
 func assessTrapped(fixes []DwellPosition, now time.Time) (bool, alertEvidence) {
 	var gps []DwellPosition
 	for _, f := range fixes {
-		if ClassifyFix(f.ValidSignal, f.Type) == FixGPS {
+		if ClassifyFix(f.ValidSignal, f.Type, f.WifiZoneID) == FixGPS {
 			gps = append(gps, f)
 		}
 	}
@@ -415,7 +415,7 @@ func latestZoneStateHome(fixes []PresencePosition) bool {
 func stationaryRunStart(fixes []DwellPosition, windowStart time.Time) time.Time {
 	var gps []DwellPosition
 	for _, f := range fixes {
-		if ClassifyFix(f.ValidSignal, f.Type) == FixGPS {
+		if ClassifyFix(f.ValidSignal, f.Type, f.WifiZoneID) == FixGPS {
 			gps = append(gps, f)
 		}
 	}
@@ -518,7 +518,7 @@ func (d *Database) assessOutOfTerritory(trackerID int, now time.Time) (bool, ale
 	}
 	var gps []DwellPosition
 	for _, f := range recent {
-		if ClassifyFix(f.ValidSignal, f.Type) == FixGPS {
+		if ClassifyFix(f.ValidSignal, f.Type, f.WifiZoneID) == FixGPS {
 			gps = append(gps, f)
 		}
 	}

@@ -9,7 +9,7 @@ import (
 // KDE utilization distributions: 50% core range vs 95% home range contours
 // (GitHub issue #3).
 //
-// Pipeline: gate fixes (only genuine GPS fixes — snapped CMD-X WiFi-zone
+// Pipeline: gate fixes (only genuine GPS fixes — snapped WiFi-zone
 // fixes would pile phantom mass at the zone center), weight each fix by
 // FixWeight(radius), project to a local equirectangular plane (meters) around
 // the data centroid, and evaluate a weighted Gaussian KDE on a regular grid.
@@ -90,7 +90,7 @@ func centroidProjection(positions []DwellPosition) (localProjection, int) {
 	var sumLat, sumLon float64
 	n := 0
 	for _, p := range positions {
-		if ClassifyFix(p.ValidSignal, p.Type) != FixGPS {
+		if ClassifyFix(p.ValidSignal, p.Type, p.WifiZoneID) != FixGPS {
 			continue
 		}
 		sumLat += p.Latitude
@@ -120,7 +120,7 @@ func gateKDEFixes(positions []DwellPosition, proj localProjection, gatedCount in
 	var fixes []kdeFix
 	seen := 0
 	for _, p := range positions {
-		if ClassifyFix(p.ValidSignal, p.Type) != FixGPS {
+		if ClassifyFix(p.ValidSignal, p.Type, p.WifiZoneID) != FixGPS {
 			continue
 		}
 		if seen%stride != 0 {
@@ -145,7 +145,7 @@ func prepareKDEFixes(positions []DwellPosition) ([]kdeFix, localProjection) {
 func kdeBandwidth(positions []DwellPosition) float64 {
 	var radii []float64
 	for _, p := range positions {
-		if ClassifyFix(p.ValidSignal, p.Type) != FixGPS {
+		if ClassifyFix(p.ValidSignal, p.Type, p.WifiZoneID) != FixGPS {
 			continue
 		}
 		if p.Radius != nil && *p.Radius > 0 {

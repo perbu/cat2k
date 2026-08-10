@@ -29,6 +29,7 @@ type ActivityPosition struct {
 	Satellites  *int
 	ValidSignal *bool
 	Type        *string
+	WifiZoneID  *int
 }
 
 // activityGate reports whether a fix is good enough to use for measurement.
@@ -36,7 +37,7 @@ type ActivityPosition struct {
 // snapped WiFi-zone fixes (FixHome) are excluded because their zone-center
 // coordinates would fabricate stillness.
 func activityGate(p ActivityPosition) bool {
-	if ClassifyFix(p.ValidSignal, p.Type) != FixGPS {
+	if ClassifyFix(p.ValidSignal, p.Type, p.WifiZoneID) != FixGPS {
 		return false
 	}
 	if p.Satellites != nil && *p.Satellites < activityMinSats {

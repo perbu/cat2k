@@ -225,7 +225,7 @@ The daemon creates six tables:
 - `valid_signal` - GPS signal validity
 - `satellites` - Number of satellites
 - `gsm` - GSM signal strength
-- `type` - Position type (`CMD-WBT-OUT` = GPS fix, `CMD-X` = WiFi-zone fix snapped to the zone)
+- `type` - Position type (`CMD-T` = GPS fix, `CMD-WBT`/`CMD-WBT-OUT` = WiFi-zone fix, `CMD-WIFIP` = WiFi-positioned fix)
 - `last_message` / `date_server` / `date_tracker` - Various timestamps
 - `radius` - Per-fix GPS accuracy estimate (meters)
 - `pdop` - Position dilution of precision

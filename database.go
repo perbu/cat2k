@@ -703,7 +703,7 @@ func (d *Database) GetPositionsForHeatmap(since time.Time) (map[int][]HeatmapPos
 // (satellites, valid_signal) needed to filter bad fixes during measurement.
 func (d *Database) GetPositionsForActivity(since time.Time) (map[int][]ActivityPosition, error) {
 	query := `
-		SELECT tracker_id, timestamp, latitude, longitude, satellites, valid_signal, type
+		SELECT tracker_id, timestamp, latitude, longitude, satellites, valid_signal, type, wifi_zone_id
 		FROM positions
 		WHERE timestamp >= ?
 		ORDER BY timestamp
@@ -721,7 +721,8 @@ func (d *Database) GetPositionsForActivity(since time.Time) (map[int][]ActivityP
 		var sats sql.NullInt64
 		var valid sql.NullBool
 		var typ sql.NullString
-		if err := rows.Scan(&p.TrackerID, &p.Timestamp, &p.Latitude, &p.Longitude, &sats, &valid, &typ); err != nil {
+		var zoneID sql.NullInt64
+		if err := rows.Scan(&p.TrackerID, &p.Timestamp, &p.Latitude, &p.Longitude, &sats, &valid, &typ, &zoneID); err != nil {
 			return nil, err
 		}
 		if sats.Valid {
@@ -735,6 +736,10 @@ func (d *Database) GetPositionsForActivity(since time.Time) (map[int][]ActivityP
 		if typ.Valid {
 			t := typ.String
 			p.Type = &t
+		}
+		if zoneID.Valid {
+			z := int(zoneID.Int64)
+			p.WifiZoneID = &z
 		}
 		result[p.TrackerID] = append(result[p.TrackerID], p)
 	}
@@ -966,7 +971,7 @@ func (d *Database) GetPositionsForPresence(trackerID int, since time.Time) ([]Pr
 // (issue #3). A zero end means "no upper bound". Gating happens in kde.go.
 func (d *Database) GetPositionsForRange(trackerID int, start, end time.Time) ([]DwellPosition, error) {
 	query := `
-		SELECT tracker_id, timestamp, latitude, longitude, valid_signal, type, radius
+		SELECT tracker_id, timestamp, latitude, longitude, valid_signal, type, wifi_zone_id, radius
 		FROM positions
 		WHERE tracker_id = ? AND timestamp >= ?
 	`
@@ -988,8 +993,8 @@ func (d *Database) GetPositionsForRange(trackerID int, start, end time.Time) ([]
 		var p DwellPosition
 		var valid sql.NullBool
 		var typ sql.NullString
-		var radius sql.NullInt64
-		if err := rows.Scan(&p.TrackerID, &p.Timestamp, &p.Latitude, &p.Longitude, &valid, &typ, &radius); err != nil {
+		var zoneID, radius sql.NullInt64
+		if err := rows.Scan(&p.TrackerID, &p.Timestamp, &p.Latitude, &p.Longitude, &valid, &typ, &zoneID, &radius); err != nil {
 			return nil, err
 		}
 		if valid.Valid {
@@ -999,6 +1004,10 @@ func (d *Database) GetPositionsForRange(trackerID int, start, end time.Time) ([]
 		if typ.Valid {
 			t := typ.String
 			p.Type = &t
+		}
+		if zoneID.Valid {
+			z := int(zoneID.Int64)
+			p.WifiZoneID = &z
 		}
 		if radius.Valid {
 			r := int(radius.Int64)

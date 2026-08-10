@@ -96,7 +96,7 @@ Key methods:
 All position inserts use `ON CONFLICT(id) DO UPDATE` on the extended quality/presence columns (radius, pdop, wifi_zone_id, …) so a re-backfill backfills them into historical rows; the insert stays idempotent because position IDs are stable. A migration in initDatabase adds the columns to pre-existing databases.
 
 ### gate.go
-Shared fix-quality gate (`ClassifyFix`): fixes are `FixInvalid` (no valid signal), `FixHome` (snapped CMD-X WiFi-zone fixes — "at home" evidence only), or `FixGPS` (usable for movement analytics). All analytics must pass fixes through this gate; `FixHome` coordinates are snapped to the zone center and fabricate stillness.
+Shared fix-quality gate (`ClassifyFix`): fixes are `FixInvalid` (no valid signal, or CMD-WIFIP WiFi-positioned fixes — sticky coordinates, zero satellites, neither GPS nor home-zone evidence), `FixHome` (snapped WiFi-zone fixes — "at home" evidence only), or `FixGPS` (usable for movement analytics). In-zone fixes are marked by `wifi_zone_id != 0`, not by type (the observed types are CMD-WBT/CMD-WBT-OUT and in-zone ALM-ON; the originally assumed CMD-X never occurs but is still mapped to FixHome as future-proofing). NULL `wifi_zone_id` (pre-migration rows) is "not home", never FixHome. All analytics must pass fixes through this gate; `FixHome` coordinates are snapped to the zone center and fabricate stillness.
 
 ### dwell.go
 Dwell-point waypoints and territory transition graph (issue #2):

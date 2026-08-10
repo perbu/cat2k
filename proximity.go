@@ -9,7 +9,7 @@ import (
 // (GitHub issue #6).
 //
 // The two collars do not sample at aligned timestamps, so both gated tracks
-// (FixGPS only — snapped CMD-X zone fixes would fabricate togetherness at the
+// (FixGPS only — snapped WiFi-zone fixes would fabricate togetherness at the
 // zone center) are interpolated onto a shared 60s grid. Interpolation is
 // honest: a grid point is only filled when its bracketing fixes are at most
 // proxMaxInterpGapS apart; wider gaps leave the point missing, so neither the
@@ -62,7 +62,7 @@ type proxFix struct {
 func gateProximityFixes(positions []DwellPosition, proj localProjection) []proxFix {
 	var fixes []proxFix
 	for _, p := range positions {
-		if ClassifyFix(p.ValidSignal, p.Type) != FixGPS {
+		if ClassifyFix(p.ValidSignal, p.Type, p.WifiZoneID) != FixGPS {
 			continue
 		}
 		x, y := proj.toXY(p.Latitude, p.Longitude)

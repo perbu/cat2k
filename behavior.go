@@ -18,7 +18,7 @@ import (
 //   - transit — long steps, low turning (directed commute)
 //
 // Pipeline: gate fixes (FixGPS only — invalid fixes are noise and snapped
-// CMD-X WiFi-zone fixes would fabricate a giant phantom rest bout at the zone
+// WiFi-zone fixes would fabricate a giant phantom rest bout at the zone
 // center), resample to a regular 60s grid, derive steps, fit the HMM with
 // Baum-Welch on a trailing training window, and decode request windows with
 // Viterbi against the persisted parameters.
@@ -176,7 +176,7 @@ func resampleBehaviorSteps(fixes []DwellPosition) [][]behaviorStep {
 	bestDelta := make(map[int64]float64)
 
 	for _, p := range fixes {
-		if ClassifyFix(p.ValidSignal, p.Type) != FixGPS {
+		if ClassifyFix(p.ValidSignal, p.Type, p.WifiZoneID) != FixGPS {
 			continue
 		}
 		unix := float64(p.Timestamp.Unix())
