@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Catboard 2000 (cat2k) is a Go daemon that syncs GPS position data from Weenect trackers to a local SQLite database. It runs on a schedule (configurable, default: every 5 minutes) and supports manual syncs and historical data backfill.
+Catboard 2000 (cat2k) is a Go daemon that syncs GPS position data from Weenect trackers to a local SQLite database. It runs on a schedule (configurable cron; code default nightly at 2am, example config every 5 minutes) and supports manual syncs and historical data backfill.
 
 The daemon also provides a web-based radar status page that shows:
 - Real-time tracker positions on a radar display (relative to home location)
@@ -48,7 +48,7 @@ Optional configuration:
 - `home_lat`, `home_lon` - Home coordinates for radar center point
 - `surehub_email`, `surehub_password` - SureHub credentials for pet flap status
 - `pois` - Array of points of interest `[{"name": "Place", "lat": 59.0, "lon": 10.0, "color": "#fff"}]`
-- `sync_schedule` - Cron expression (default: `*/5 * * * *` for every 5 minutes)
+- `sync_schedule` - Cron expression (code default: `0 2 * * *` nightly at 2am; `config.example.json` ships `*/5 * * * *`)
 - `http_listen` - HTTP server listen address (default: `:8080`, e.g., `127.0.0.1:8080` for localhost only)
 
 Copy `config.example.json` to `config.json` to get started.
@@ -80,7 +80,7 @@ Key methods:
 - `fetchAndStorePositions()` - Internal method that handles 24h chunking
 
 ### database.go
-SQLite operations using modernc.org/sqlite driver. Five tables:
+SQLite operations using modernc.org/sqlite driver. Six tables:
 - `trackers` - Tracker metadata with `last_sync_timestamp`
 - `positions` - GPS positions (idempotent inserts by position ID)
 - `sync_log` - Sync operation history

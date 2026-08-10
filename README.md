@@ -9,12 +9,15 @@ This is not meant to be generally useful, but rather a personal project to figur
 
 ## Features
 
-- **Scheduled Syncing**: Runs on a configurable schedule (default: nightly at 2am)
+- **Scheduled Syncing**: Runs on a configurable schedule (code default: nightly at 2am; the shipped `config.example.json` uses every 5 minutes)
 - **Rate Limiting**: Respects API rate limits (default: 4 requests/second)
 - **Idempotent**: Re-running syncs won't create duplicate records
 - **Resumable**: Tracks last sync time per tracker for incremental syncs
 - **Backfill Support**: Can fetch historical data before daemon was running
 - **SQLite Storage**: Zero-config embedded database
+- **Web UI** (`http_listen`, default `:8080`):
+  - **Map view**: per-cat heatmaps, movement trails, dwell-point waypoints with a territory transition graph, KDE 50% core / 95% home-range contours with a month picker, state-colored tracks (rest / forage / transit from an HMM), activity budgets, presence ribbons, excursion stats, inter-cat proximity (together episodes, patrol shifts, lead/follow)
+  - **Radar status page**: live positions relative to home, battery, WiFi-zone presence chips ("home" / "out for 2h 14m"), SureHub flap status, POIs, and trapped/out-of-territory alert banner with history
 
 ## Installation
 
@@ -69,9 +72,19 @@ Copy `config.example.json` to one of the default locations (e.g., `./config.json
   "rate_limit": 4.0,
   "backfill_start_date": "2024-01-01",
   "sync_schedule": "0 2 * * *",
-  "log_level": "info"
+  "log_level": "info",
+  "http_listen": ":8080",
+  "home_lat": 59.0,
+  "home_lon": 10.0,
+  "surehub_email": "optional-surehub-email",
+  "surehub_password": "optional-surehub-password",
+  "pois": [{"name": "Cabin", "lat": 59.1, "lon": 10.1, "color": "#fff"}]
 }
 ```
+
+`home_lat`/`home_lon` center the radar status page; `surehub_*` enables pet flap
+inside/outside status; `pois` adds markers to the radar; `http_listen` sets the
+web UI address (use `127.0.0.1:8080` to bind localhost only). All are optional.
 
 The daemon will automatically find and use it. If you need a custom location:
 
@@ -190,7 +203,7 @@ Tracker: Cat Tracker (ID: 12346)
 
 ## Database Schema
 
-The daemon creates three tables:
+The daemon creates six tables:
 
 ### `trackers`
 
@@ -212,9 +225,19 @@ The daemon creates three tables:
 - `valid_signal` - GPS signal validity
 - `satellites` - Number of satellites
 - `gsm` - GSM signal strength
-- `type` - Position type
+- `type` - Position type (`CMD-WBT-OUT` = GPS fix, `CMD-X` = WiFi-zone fix snapped to the zone)
 - `last_message` / `date_server` / `date_tracker` - Various timestamps
+- `radius` - Per-fix GPS accuracy estimate (meters)
+- `pdop` - Position dilution of precision
+- `wifi_zone_id` / `wifi_zone_id_exited` - WiFi-zone presence (home detection)
+- `sensor_status` / `is_in_deep_sleep` / `geofence_name` - Device state
+- `gsm_state` / `accuracy_state` / `battery_state` - Enum quality states
+- `off_reason` - Why the tracker went offline
 - `created_at` - Record creation time
+
+Existing databases are migrated automatically (missing columns are added on
+startup). Re-run a backfill once to populate the extended columns for
+historical rows — inserts upsert them on conflict.
 
 ### `sync_log`
 
@@ -226,6 +249,20 @@ The daemon creates three tables:
 - `success` - Whether sync succeeded
 - `error_message` - Error details if failed
 - `duration_ms` - Sync duration in milliseconds
+
+### `waypoints`
+
+User-assigned names for detected dwell-point clusters (identity by centroid);
+clustering itself is recomputed on demand.
+
+### `behavior_models`
+
+Fitted HMM parameters per tracker (JSON blob), refit on demand when stale.
+
+### `alerts`
+
+Alert event log (trapped / out-of-territory); `cleared_at IS NULL` marks the
+active alert per tracker and kind.
 
 ## Running as a Service
 
