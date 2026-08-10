@@ -10,8 +10,8 @@ github.com/ncruces/go-strftime v0.1.9 h1:bY0MQC28UADQmHmaF5dgpLmImcShSi2kHU9XLdh
 github.com/ncruces/go-strftime v0.1.9/go.mod h1:Fwc5htZGVVkseilnfgOVb9mKy6w1naJmn9CehxcKcls=
 github.com/perbu/go-sure v0.0.0-20251129095105-b73bcc0c9aab h1:RTIalb91A25vK0iARQV6GMdzewGspSsQqrrd42RLJgM=
 github.com/perbu/go-sure v0.0.0-20251129095105-b73bcc0c9aab/go.mod h1:VBP0sK+l3suZtQQL0kZe/ioPnKM9F+T6Z7JcN0drYyE=
-github.com/perbu/weenect-go v0.0.0-20250930182022-875f5604d7e4 h1:OqlDCRA8JV70335yUAS77R75gIOmcAMVB/gPcMPoIxg=
-github.com/perbu/weenect-go v0.0.0-20250930182022-875f5604d7e4/go.mod h1:0+UVGy/7WstBLNIVNM7wMnppLh1SftdIq7zArjtK3t4=
+github.com/perbu/weenect-go v0.0.0-20260810060208-decffd9cdf77 h1:y+YRZFJW4kFYyPTmsS6cqxW5e2YkXmlQZYB+ejNOc5U=
+github.com/perbu/weenect-go v0.0.0-20260810060208-decffd9cdf77/go.mod h1:0+UVGy/7WstBLNIVNM7wMnppLh1SftdIq7zArjtK3t4=
 github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec h1:W09IVJc94icq4NjY3clb7Lk8O1qJ8BdBEF8z0ibU0rE=
 github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec/go.mod h1:qqbHyh8v60DhA7CoWK5oRCqLrMHRGoxYCSS9EjAz6Eo=
 github.com/robfig/cron/v3 v3.0.1 h1:WdRxkvbJztn8LMz/QEvLN5sBU+xKpSqwwUO1Pjr4qDs=

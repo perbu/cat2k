@@ -87,7 +87,7 @@ SQLite operations using modernc.org/sqlite driver. Three tables:
 Key methods:
 - `GetLatestPositions()` - Returns most recent position per tracker (used by status page)
 
-All position inserts use `ON CONFLICT(id) DO NOTHING` for idempotency.
+All position inserts use `ON CONFLICT(id) DO UPDATE` on the extended quality/presence columns (radius, pdop, wifi_zone_id, …) so a re-backfill backfills them into historical rows; the insert stays idempotent because position IDs are stable. A migration in initDatabase adds the columns to pre-existing databases.
 
 ### scheduler.go
 Cron-based scheduling using github.com/robfig/cron/v3. Runs sync jobs on configured schedule with graceful shutdown support.
@@ -119,7 +119,7 @@ Radar-style status page showing:
 
 ## Key Design Patterns
 
-**Idempotency**: Position records use API-provided IDs as primary keys with `ON CONFLICT DO NOTHING`, allowing safe re-syncing without duplicates.
+**Idempotency**: Position records use API-provided IDs as primary keys. Inserts are `ON CONFLICT(id) DO UPDATE` on the extended columns only, so re-syncing never duplicates and re-backfills refresh quality fields.
 
 **Resumability**: Each tracker stores `last_sync_timestamp`. Syncs are incremental from this timestamp. Updated after each successful 24h chunk, so interrupted syncs can resume.
 

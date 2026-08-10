@@ -26,22 +26,34 @@ type TrackerRecord struct {
 
 // PositionRecord represents a position in the database
 type PositionRecord struct {
-	ID           string
-	TrackerID    int
-	Timestamp    time.Time
-	Latitude     float64
-	Longitude    float64
-	Battery      *int
-	Speed        *float64
-	Direction    *int
-	ValidSignal  *bool
-	Satellites   *int
-	GSM          *int
-	Type         *string
-	LastMessage  *time.Time
-	DateServer   *time.Time
-	DateTracker  *time.Time
-	CreatedAt    time.Time
+	ID          string
+	TrackerID   int
+	Timestamp   time.Time
+	Latitude    float64
+	Longitude   float64
+	Battery     *int
+	Speed       *float64
+	Direction   *int
+	ValidSignal *bool
+	Satellites  *int
+	GSM         *int
+	Type        *string
+	LastMessage *time.Time
+	DateServer  *time.Time
+	DateTracker *time.Time
+	// Extended per-fix quality and presence fields (see GitHub issue #1).
+	Radius           *int
+	PDOP             *float64
+	WifiZoneID       *int
+	WifiZoneIDExited *int
+	SensorStatus     *string
+	IsInDeepSleep    *bool
+	GeofenceName     *string
+	GSMState         *string
+	AccuracyState    *string
+	BatteryState     *string
+	OffReason        *string
+	CreatedAt        time.Time
 }
 
 // SyncLogRecord represents a sync log entry
@@ -102,6 +114,17 @@ CREATE TABLE IF NOT EXISTS positions (
   last_message DATETIME,
   date_server DATETIME,
   date_tracker DATETIME,
+  radius INTEGER,
+  pdop REAL,
+  wifi_zone_id INTEGER,
+  wifi_zone_id_exited INTEGER,
+  sensor_status TEXT,
+  is_in_deep_sleep BOOLEAN,
+  geofence_name TEXT,
+  gsm_state TEXT,
+  accuracy_state TEXT,
+  battery_state TEXT,
+  off_reason TEXT,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (tracker_id) REFERENCES trackers(id)
 );
@@ -192,7 +215,71 @@ func initDatabase(dbPath string) (*Database, error) {
 		return nil, fmt.Errorf("failed to create schema: %w", err)
 	}
 
+	// CREATE TABLE IF NOT EXISTS does not add columns to databases created
+	// before the extended position fields (issue #1) were introduced.
+	if err := migratePositionsTable(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to migrate positions table: %w", err)
+	}
+
 	return &Database{db: db}, nil
+}
+
+// positionColumns lists every column of the positions table added after the
+// original schema, with its DDL definition. Fresh databases get these from the
+// CREATE TABLE statement; existing databases get them via ALTER TABLE here.
+var positionColumns = []struct {
+	name string
+	ddl  string
+}{
+	{"radius", "radius INTEGER"},
+	{"pdop", "pdop REAL"},
+	{"wifi_zone_id", "wifi_zone_id INTEGER"},
+	{"wifi_zone_id_exited", "wifi_zone_id_exited INTEGER"},
+	{"sensor_status", "sensor_status TEXT"},
+	{"is_in_deep_sleep", "is_in_deep_sleep BOOLEAN"},
+	{"geofence_name", "geofence_name TEXT"},
+	{"gsm_state", "gsm_state TEXT"},
+	{"accuracy_state", "accuracy_state TEXT"},
+	{"battery_state", "battery_state TEXT"},
+	{"off_reason", "off_reason TEXT"},
+}
+
+// migratePositionsTable adds any missing extended columns to an existing
+// positions table. Idempotent: columns that already exist are skipped.
+func migratePositionsTable(db *sql.DB) error {
+	rows, err := db.Query("PRAGMA table_info(positions)")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	existing := make(map[string]bool)
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull int
+		var dflt sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
+			return err
+		}
+		existing[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, col := range positionColumns {
+		if existing[col.name] {
+			continue
+		}
+		if _, err := db.Exec("ALTER TABLE positions ADD COLUMN " + col.ddl); err != nil {
+			return fmt.Errorf("failed to add column %s: %w", col.name, err)
+		}
+	}
+
+	return nil
 }
 
 // Close closes the database connection
@@ -247,21 +334,41 @@ func (d *Database) UpdateTrackerSyncTime(id int, syncTime time.Time) error {
 	return err
 }
 
-// InsertPosition inserts a position (idempotent by position ID)
+// InsertPosition inserts a position (idempotent by position ID). On conflict
+// the extended quality/presence columns are updated so a re-backfill fills
+// them in for historical rows; position IDs are stable, so this stays
+// idempotent.
 func (d *Database) InsertPosition(p *PositionRecord) error {
 	query := `
 		INSERT INTO positions (
 			id, tracker_id, timestamp, latitude, longitude,
 			battery, speed, direction, valid_signal, satellites,
 			gsm, type, last_message, date_server, date_tracker,
+			radius, pdop, wifi_zone_id, wifi_zone_id_exited,
+			sensor_status, is_in_deep_sleep, geofence_name,
+			gsm_state, accuracy_state, battery_state, off_reason,
 			created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-		ON CONFLICT(id) DO NOTHING
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(id) DO UPDATE SET
+			radius = excluded.radius,
+			pdop = excluded.pdop,
+			wifi_zone_id = excluded.wifi_zone_id,
+			wifi_zone_id_exited = excluded.wifi_zone_id_exited,
+			sensor_status = excluded.sensor_status,
+			is_in_deep_sleep = excluded.is_in_deep_sleep,
+			geofence_name = excluded.geofence_name,
+			gsm_state = excluded.gsm_state,
+			accuracy_state = excluded.accuracy_state,
+			battery_state = excluded.battery_state,
+			off_reason = excluded.off_reason
 	`
 	_, err := d.db.Exec(query,
 		p.ID, p.TrackerID, p.Timestamp, p.Latitude, p.Longitude,
 		p.Battery, p.Speed, p.Direction, p.ValidSignal, p.Satellites,
 		p.GSM, p.Type, p.LastMessage, p.DateServer, p.DateTracker,
+		p.Radius, p.PDOP, p.WifiZoneID, p.WifiZoneIDExited,
+		p.SensorStatus, p.IsInDeepSleep, p.GeofenceName,
+		p.GSMState, p.AccuracyState, p.BatteryState, p.OffReason,
 	)
 	return err
 }
@@ -548,7 +655,7 @@ func (d *Database) GetPositionsForHeatmap(since time.Time) (map[int][]HeatmapPos
 // (satellites, valid_signal) needed to filter bad fixes during measurement.
 func (d *Database) GetPositionsForActivity(since time.Time) (map[int][]ActivityPosition, error) {
 	query := `
-		SELECT tracker_id, timestamp, latitude, longitude, satellites, valid_signal
+		SELECT tracker_id, timestamp, latitude, longitude, satellites, valid_signal, type
 		FROM positions
 		WHERE timestamp >= ?
 		ORDER BY timestamp
@@ -565,7 +672,8 @@ func (d *Database) GetPositionsForActivity(since time.Time) (map[int][]ActivityP
 		var p ActivityPosition
 		var sats sql.NullInt64
 		var valid sql.NullBool
-		if err := rows.Scan(&p.TrackerID, &p.Timestamp, &p.Latitude, &p.Longitude, &sats, &valid); err != nil {
+		var typ sql.NullString
+		if err := rows.Scan(&p.TrackerID, &p.Timestamp, &p.Latitude, &p.Longitude, &sats, &valid, &typ); err != nil {
 			return nil, err
 		}
 		if sats.Valid {
@@ -575,6 +683,10 @@ func (d *Database) GetPositionsForActivity(since time.Time) (map[int][]ActivityP
 		if valid.Valid {
 			v := valid.Bool
 			p.ValidSignal = &v
+		}
+		if typ.Valid {
+			t := typ.String
+			p.Type = &t
 		}
 		result[p.TrackerID] = append(result[p.TrackerID], p)
 	}

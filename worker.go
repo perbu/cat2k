@@ -337,12 +337,21 @@ func (w *SyncWorker) fetchAndStorePositions(ctx context.Context, trackerID int, 
 
 			// Convert non-pointer fields to pointers for database
 			battery := pos.Battery
-			speed := pos.Speed
 			direction := pos.Direction
 			validSignal := pos.ValidSignal
 			satellites := pos.Satellites
 			gsm := pos.GSM
 			typ := pos.Type
+
+			// Extended per-fix quality and presence fields (issue #1)
+			radius := pos.Radius
+			wifiZoneID := pos.WifiZoneID
+			wifiZoneIDExited := pos.WifiZoneIDExited
+			sensorStatus := pos.SensorStatus
+			isInDeepSleep := pos.IsInDeepSleep
+			gsmState := pos.GSMState
+			accuracyState := pos.AccuracyState
+			batteryState := pos.BatteryState
 
 			record := &PositionRecord{
 				ID:          pos.ID,
@@ -351,7 +360,7 @@ func (w *SyncWorker) fetchAndStorePositions(ctx context.Context, trackerID int, 
 				Latitude:    pos.Latitude,
 				Longitude:   pos.Longitude,
 				Battery:     &battery,
-				Speed:       &speed,
+				Speed:       pos.Speed,
 				Direction:   &direction,
 				ValidSignal: &validSignal,
 				Satellites:  &satellites,
@@ -360,6 +369,18 @@ func (w *SyncWorker) fetchAndStorePositions(ctx context.Context, trackerID int, 
 				LastMessage: lastMessage,
 				DateServer:  dateServer,
 				DateTracker: dateTracker,
+
+				Radius:           &radius,
+				PDOP:             pos.PDOP,
+				WifiZoneID:       &wifiZoneID,
+				WifiZoneIDExited: &wifiZoneIDExited,
+				SensorStatus:     &sensorStatus,
+				IsInDeepSleep:    &isInDeepSleep,
+				GeofenceName:     pos.GeofenceName,
+				GSMState:         &gsmState,
+				AccuracyState:    &accuracyState,
+				BatteryState:     &batteryState,
+				OffReason:        pos.OffReason,
 			}
 
 			if err := w.db.InsertPosition(record); err != nil {

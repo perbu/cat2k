@@ -28,28 +28,32 @@ type ActivityPosition struct {
 	Longitude   float64
 	Satellites  *int
 	ValidSignal *bool
-}
-
-// DayActivity holds the computed activity metrics for one calendar day.
-type DayActivity struct {
-	Date           string  `json:"date"`            // YYYY-MM-DD (local)
-	DistanceM      float64 `json:"distance_m"`      // summed travel above the jitter floor
-	ActiveFraction float64 `json:"active_fraction"` // fraction of intervals where the cat moved
-	RangeM         float64 `json:"range_m"`         // furthest distance from home reached
-	Fixes          int     `json:"fixes"`           // number of good fixes used
-	Intervals      int     `json:"intervals"`       // measured intervals (denominator of active_fraction)
-	ActiveIntervals int    `json:"active_intervals"` // intervals where the hop cleared the active floor
+	Type        *string
 }
 
 // activityGate reports whether a fix is good enough to use for measurement.
+// It builds on the shared fix gate (gate.go): invalid fixes are dropped, and
+// snapped WiFi-zone fixes (FixHome) are excluded because their zone-center
+// coordinates would fabricate stillness.
 func activityGate(p ActivityPosition) bool {
-	if p.ValidSignal != nil && !*p.ValidSignal {
+	if ClassifyFix(p.ValidSignal, p.Type) != FixGPS {
 		return false
 	}
 	if p.Satellites != nil && *p.Satellites < activityMinSats {
 		return false
 	}
 	return true
+}
+
+// DayActivity holds the computed activity metrics for one calendar day.
+type DayActivity struct {
+	Date            string  `json:"date"`             // YYYY-MM-DD (local)
+	DistanceM       float64 `json:"distance_m"`       // summed travel above the jitter floor
+	ActiveFraction  float64 `json:"active_fraction"`  // fraction of intervals where the cat moved
+	RangeM          float64 `json:"range_m"`          // furthest distance from home reached
+	Fixes           int     `json:"fixes"`            // number of good fixes used
+	Intervals       int     `json:"intervals"`        // measured intervals (denominator of active_fraction)
+	ActiveIntervals int     `json:"active_intervals"` // intervals where the hop cleared the active floor
 }
 
 // computeActivity bins gated positions by local calendar day and returns one
