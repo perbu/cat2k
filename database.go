@@ -149,6 +149,20 @@ CREATE TABLE IF NOT EXISTS sync_log (
   duration_ms INTEGER,
   FOREIGN KEY (tracker_id) REFERENCES trackers(id)
 );
+
+-- Dwell-point waypoints (issue #2). Clustering runs on demand; this table
+-- only persists waypoint identity (per tracker, matched by centroid
+-- proximity) and the user-assigned name so names survive recomputation.
+CREATE TABLE IF NOT EXISTS waypoints (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tracker_id INTEGER NOT NULL,
+  latitude REAL NOT NULL,
+  longitude REAL NOT NULL,
+  name TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (tracker_id) REFERENCES trackers(id)
+);
 `
 
 // ensureDatabaseDir checks that the database file's directory exists, creating
@@ -720,6 +734,141 @@ func (d *Database) GetLatestPositions() ([]LatestPosition, error) {
 		err := rows.Scan(&p.TrackerID, &p.TrackerName, &p.Latitude, &p.Longitude, &p.Timestamp, &p.Battery)
 		if err != nil {
 			return nil, err
+		}
+		positions = append(positions, p)
+	}
+
+	return positions, rows.Err()
+}
+
+// WaypointRecord is a stored dwell-point waypoint (issue #2): the persistent
+// identity of a detected cluster, plus its user-assigned name.
+type WaypointRecord struct {
+	ID        int64
+	TrackerID int
+	Latitude  float64
+	Longitude float64
+	Name      *string
+}
+
+// GetWaypoints returns all stored waypoints for a tracker.
+func (d *Database) GetWaypoints(trackerID int) ([]WaypointRecord, error) {
+	query := `
+		SELECT id, tracker_id, latitude, longitude, name
+		FROM waypoints
+		WHERE tracker_id = ?
+		ORDER BY id
+	`
+
+	rows, err := d.db.Query(query, trackerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var waypoints []WaypointRecord
+	for rows.Next() {
+		var w WaypointRecord
+		if err := rows.Scan(&w.ID, &w.TrackerID, &w.Latitude, &w.Longitude, &w.Name); err != nil {
+			return nil, err
+		}
+		waypoints = append(waypoints, w)
+	}
+
+	return waypoints, rows.Err()
+}
+
+// GetWaypoint retrieves a single waypoint by ID (nil, nil when absent).
+func (d *Database) GetWaypoint(id int64) (*WaypointRecord, error) {
+	query := `
+		SELECT id, tracker_id, latitude, longitude, name
+		FROM waypoints
+		WHERE id = ?
+	`
+	var w WaypointRecord
+	err := d.db.QueryRow(query, id).Scan(&w.ID, &w.TrackerID, &w.Latitude, &w.Longitude, &w.Name)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &w, nil
+}
+
+// CreateWaypoint stores a newly detected waypoint and returns its ID.
+func (d *Database) CreateWaypoint(trackerID int, lat, lon float64) (int64, error) {
+	query := `
+		INSERT INTO waypoints (tracker_id, latitude, longitude, created_at, updated_at)
+		VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+	`
+	res, err := d.db.Exec(query, trackerID, lat, lon)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// UpdateWaypointLocation refreshes a stored waypoint's centroid after a
+// recomputation matched it to a (slightly drifted) cluster.
+func (d *Database) UpdateWaypointLocation(id int64, lat, lon float64) error {
+	query := `
+		UPDATE waypoints
+		SET latitude = ?, longitude = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ?
+	`
+	_, err := d.db.Exec(query, lat, lon, id)
+	return err
+}
+
+// SetWaypointName assigns or clears (nil name) a waypoint's user name.
+func (d *Database) SetWaypointName(id int64, name *string) error {
+	query := `
+		UPDATE waypoints
+		SET name = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ?
+	`
+	_, err := d.db.Exec(query, name, id)
+	return err
+}
+
+// GetPositionsForDwell returns gate-eligible fields for a tracker since a
+// given time, ordered by timestamp, for dwell analysis (issue #2). Follows
+// GetPositionsForActivity's pattern; gating itself happens in dwell.go.
+func (d *Database) GetPositionsForDwell(trackerID int, since time.Time) ([]DwellPosition, error) {
+	query := `
+		SELECT tracker_id, timestamp, latitude, longitude, valid_signal, type, radius
+		FROM positions
+		WHERE tracker_id = ? AND timestamp >= ?
+		ORDER BY timestamp
+	`
+
+	rows, err := d.db.Query(query, trackerID, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var positions []DwellPosition
+	for rows.Next() {
+		var p DwellPosition
+		var valid sql.NullBool
+		var typ sql.NullString
+		var radius sql.NullInt64
+		if err := rows.Scan(&p.TrackerID, &p.Timestamp, &p.Latitude, &p.Longitude, &valid, &typ, &radius); err != nil {
+			return nil, err
+		}
+		if valid.Valid {
+			v := valid.Bool
+			p.ValidSignal = &v
+		}
+		if typ.Valid {
+			t := typ.String
+			p.Type = &t
+		}
+		if radius.Valid {
+			r := int(radius.Int64)
+			p.Radius = &r
 		}
 		positions = append(positions, p)
 	}

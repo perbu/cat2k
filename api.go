@@ -64,6 +64,8 @@ func NewAPIServer(db *Database, cfg *Config, worker *SyncWorker, listenAddr stri
 	mux.HandleFunc("/api/status", api.handleGetStatus)
 	mux.HandleFunc("/api/heatmap", api.handleGetHeatmap)
 	mux.HandleFunc("/api/activity", api.handleGetActivity)
+	mux.HandleFunc("/api/waypoints", api.handleGetWaypoints)
+	mux.HandleFunc("/api/waypoints/", api.handleWaypointRoutes)
 	mux.HandleFunc("/api/events", api.handleEvents)
 	mux.HandleFunc("/api/sync", api.handleSync)
 	mux.HandleFunc("/health", api.handleHealth)
@@ -422,9 +424,9 @@ type TrackerStatus struct {
 	Lon       float64        `json:"lon"`
 	Battery   *int           `json:"battery,omitempty"`
 	Timestamp time.Time      `json:"timestamp"`
-	IsInside  *bool          `json:"is_inside,omitempty"`  // From SureHub pet flap
-	LastFlap  *string        `json:"last_flap,omitempty"`  // Time of last flap activity
-	History   []HistoryPoint `json:"history,omitempty"`    // Recent position history for trail
+	IsInside  *bool          `json:"is_inside,omitempty"` // From SureHub pet flap
+	LastFlap  *string        `json:"last_flap,omitempty"` // Time of last flap activity
+	History   []HistoryPoint `json:"history,omitempty"`   // Recent position history for trail
 }
 
 // Color palette for auto-assigning tracker colors
@@ -656,6 +658,187 @@ func (a *APIServer) handleGetActivity(w http.ResponseWriter, r *http.Request) {
 	a.writeJSON(w, http.StatusOK, resp)
 }
 
+// WaypointsResponse represents the /api/waypoints response.
+type WaypointsResponse struct {
+	TrackerID int        `json:"tracker_id"`
+	Days      int        `json:"days"`
+	Waypoints []Waypoint `json:"waypoints"`
+}
+
+// TransitionsResponse represents the /api/waypoints/transitions response.
+type TransitionsResponse struct {
+	TrackerID int                  `json:"tracker_id"`
+	Days      int                  `json:"days"`
+	Edges     []WaypointTransition `json:"edges"`
+}
+
+// parseWaypointParams extracts and validates the tracker_id and days query
+// parameters shared by the waypoint endpoints. Days defaults to 30.
+func (a *APIServer) parseWaypointParams(w http.ResponseWriter, r *http.Request) (trackerID, days int, ok bool) {
+	trackerID, err := strconv.Atoi(r.URL.Query().Get("tracker_id"))
+	if err != nil || trackerID <= 0 {
+		a.writeError(w, http.StatusBadRequest, "Invalid or missing tracker_id")
+		return 0, 0, false
+	}
+
+	exists, err := a.db.TrackerExists(trackerID)
+	if err != nil {
+		a.logger.Error("Failed to check tracker existence", "tracker_id", trackerID, "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Database error")
+		return 0, 0, false
+	}
+	if !exists {
+		a.writeError(w, http.StatusNotFound, "Tracker not found")
+		return 0, 0, false
+	}
+
+	days = 30
+	if daysStr := r.URL.Query().Get("days"); daysStr != "" {
+		if d, err := strconv.Atoi(daysStr); err == nil && d >= 1 && d <= 365 {
+			days = d
+		}
+	}
+
+	return trackerID, days, true
+}
+
+// activityLocation returns the configured day-bucketing timezone, falling back
+// to the server timezone (same rule as /api/activity).
+func (a *APIServer) activityLocation() *time.Location {
+	loc, err := a.cfg.ActivityLocation()
+	if err != nil {
+		a.logger.Warn("Falling back to server timezone", "error", err)
+	}
+	return loc
+}
+
+// handleGetWaypoints handles GET /api/waypoints?tracker_id=&days= - detected
+// dwell-point waypoints with stats and (stored or auto) names.
+func (a *APIServer) handleGetWaypoints(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		a.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	trackerID, days, ok := a.parseWaypointParams(w, r)
+	if !ok {
+		return
+	}
+
+	waypoints, _, err := a.db.computeWaypoints(trackerID, days, a.activityLocation())
+	if err != nil {
+		a.logger.Error("Failed to compute waypoints", "tracker_id", trackerID, "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Failed to compute waypoints")
+		return
+	}
+	if waypoints == nil {
+		waypoints = []Waypoint{}
+	}
+
+	a.writeJSON(w, http.StatusOK, WaypointsResponse{
+		TrackerID: trackerID,
+		Days:      days,
+		Waypoints: waypoints,
+	})
+}
+
+// handleWaypointRoutes dispatches /api/waypoints/<sub>: "transitions" for the
+// transition graph, or a numeric waypoint ID for renaming.
+func (a *APIServer) handleWaypointRoutes(w http.ResponseWriter, r *http.Request) {
+	sub := strings.TrimPrefix(r.URL.Path, "/api/waypoints/")
+	if sub == "transitions" {
+		a.handleGetTransitions(w, r)
+		return
+	}
+
+	id, err := strconv.ParseInt(sub, 10, 64)
+	if err != nil || id <= 0 {
+		a.writeError(w, http.StatusBadRequest, "Invalid waypoint ID")
+		return
+	}
+	a.handleRenameWaypoint(w, r, id)
+}
+
+// handleGetTransitions handles GET /api/waypoints/transitions?tracker_id=&days=
+// - directed edges of the territory transition graph.
+func (a *APIServer) handleGetTransitions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		a.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	trackerID, days, ok := a.parseWaypointParams(w, r)
+	if !ok {
+		return
+	}
+
+	_, transitions, err := a.db.computeWaypoints(trackerID, days, a.activityLocation())
+	if err != nil {
+		a.logger.Error("Failed to compute transitions", "tracker_id", trackerID, "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Failed to compute transitions")
+		return
+	}
+	if transitions == nil {
+		transitions = []WaypointTransition{}
+	}
+
+	a.writeJSON(w, http.StatusOK, TransitionsResponse{
+		TrackerID: trackerID,
+		Days:      days,
+		Edges:     transitions,
+	})
+}
+
+// handleRenameWaypoint handles PUT /api/waypoints/{id} with a JSON body
+// {"name": "..."} - assigns (or clears, with an empty name) a waypoint's
+// user-assigned name.
+func (a *APIServer) handleRenameWaypoint(w http.ResponseWriter, r *http.Request, id int64) {
+	if r.Method != http.MethodPut && r.Method != http.MethodPost {
+		a.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		a.writeError(w, http.StatusBadRequest, "Invalid JSON body")
+		return
+	}
+	name := strings.TrimSpace(body.Name)
+	if !waypointNameValid(name) {
+		a.writeError(w, http.StatusBadRequest, "Name too long (max 100 characters)")
+		return
+	}
+
+	waypoint, err := a.db.GetWaypoint(id)
+	if err != nil {
+		a.logger.Error("Failed to get waypoint", "waypoint_id", id, "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Database error")
+		return
+	}
+	if waypoint == nil {
+		a.writeError(w, http.StatusNotFound, "Waypoint not found")
+		return
+	}
+
+	var namePtr *string
+	if name != "" {
+		namePtr = &name
+	}
+	if err := a.db.SetWaypointName(id, namePtr); err != nil {
+		a.logger.Error("Failed to rename waypoint", "waypoint_id", id, "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Failed to rename waypoint")
+		return
+	}
+
+	a.logger.Info("Waypoint renamed", "waypoint_id", id, "tracker_id", waypoint.TrackerID, "name", name)
+	a.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"id":   id,
+		"name": name,
+	})
+}
+
 // HeatmapBin represents a single bin in the heatmap grid
 type HeatmapBin struct {
 	X     int `json:"x"`
@@ -678,7 +861,6 @@ type HeatmapResponse struct {
 	Days       int                        `json:"days"`
 	Trackers   map[int]HeatmapTrackerData `json:"trackers"`
 }
-
 
 // handleGetHeatmap handles GET /api/heatmap
 func (a *APIServer) handleGetHeatmap(w http.ResponseWriter, r *http.Request) {

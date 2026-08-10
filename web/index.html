@@ -554,6 +554,121 @@
         /* Additive blending so overlapping heatmaps mix toward white */
         .leaflet-heatmap-layer { mix-blend-mode: screen; }
 
+        /* ---------- Waypoints & top places ---------- */
+        .wp-toggle-row {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-top: 12px;
+        }
+
+        #top-places {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .place-card {
+            background: var(--card);
+            border: 1px solid var(--card-border);
+            border-radius: 14px;
+            padding: 11px 14px;
+        }
+
+        .place-cat {
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            margin-bottom: 4px;
+        }
+
+        .place-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 4px 0;
+            cursor: pointer;
+        }
+
+        .place-row:hover .place-name { text-decoration: underline; }
+
+        .place-dot {
+            width: 9px;
+            height: 9px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+
+        .place-name {
+            flex: 1;
+            font-size: 13px;
+            font-weight: 600;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .place-share { font-size: 12px; color: var(--text-2); }
+
+        .place-trend {
+            width: 36px;
+            text-align: right;
+            font-size: 11px;
+            font-weight: 600;
+        }
+
+        .trend-up   { color: var(--bella); }
+        .trend-down { color: #E5484D; }
+        .trend-flat { color: var(--text-4); }
+
+        /* Waypoint popup (rendered inside Leaflet's popup container) */
+        .wp-popup { min-width: 170px; font-family: 'Hanken Grotesk', sans-serif; }
+        .wp-title { font-size: 13px; font-weight: 700; margin-bottom: 6px; }
+
+        .wp-row-line {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            font-size: 11.5px;
+            line-height: 1.7;
+        }
+
+        .wp-row-line span { color: var(--text-3); }
+        .wp-row-line b { font-family: 'JetBrains Mono', monospace; font-weight: 500; }
+
+        .wp-hist {
+            display: flex;
+            align-items: flex-end;
+            gap: 1px;
+            height: 26px;
+            margin-top: 8px;
+        }
+
+        .wp-hist-labels {
+            display: flex;
+            justify-content: space-between;
+            font-size: 9px;
+            color: var(--text-4);
+            margin-top: 2px;
+        }
+
+        .wp-rename {
+            margin-top: 8px;
+            width: 100%;
+            border: 1px solid var(--card-border);
+            background: #fff;
+            border-radius: 8px;
+            padding: 5px 0;
+            font-family: inherit;
+            font-size: 11.5px;
+            font-weight: 600;
+            color: var(--text-2);
+            cursor: pointer;
+        }
+
+        .wp-rename:hover { color: var(--ink); border-color: var(--ink); }
+
         .cat-pin-icon { background: transparent; border: none; }
 
         /* ---------- Map overlays ---------- */
@@ -696,6 +811,31 @@
                     </div>
                 </div>
             </div>
+
+            <!-- Waypoints -->
+            <div class="heatmap-card">
+                <div class="heatmap-head">
+                    <div>
+                        <div class="card-title">Waypoints</div>
+                        <div class="card-sub">Places the cats linger</div>
+                    </div>
+                    <button class="toggle on" id="places-toggle" role="switch" aria-checked="true" aria-label="Show waypoints">
+                        <span class="knob"></span>
+                    </button>
+                </div>
+                <div class="wp-toggle-row">
+                    <div>
+                        <div class="card-title">Routes</div>
+                        <div class="card-sub">How they move between places</div>
+                    </div>
+                    <button class="toggle" id="routes-toggle" role="switch" aria-checked="false" aria-label="Show transition graph">
+                        <span class="knob"></span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Top places -->
+            <div id="top-places"></div>
 
             <!-- Footer -->
             <div class="panel-footer">

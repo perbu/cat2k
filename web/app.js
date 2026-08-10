@@ -55,6 +55,14 @@ let heatMapSettings = {
     radius: 25,
     blur: 15
 };
+let waypointsByTracker = {};   // trackerId -> waypoints[] from /api/waypoints
+let transitionsByTracker = {}; // trackerId -> edges[] from /api/waypoints/transitions
+let waypointMarkers = {};      // trackerId -> L.layerGroup of waypoint markers
+let routeLayers = {};          // trackerId -> L.layerGroup of transition edges
+let waypointSettings = {
+    places: true,              // waypoint markers on the map
+    routes: false              // transition-graph overlay
+};
 
 function paletteForIndex(idx) {
     return HEATMAP_PALETTES[idx % HEATMAP_PALETTES.length];
@@ -601,6 +609,215 @@ function renderTrails() {
     });
 }
 
+// Escape user-supplied text (waypoint names) for safe HTML interpolation.
+function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+}
+
+// Whole days covered by the current date-range selection (the unit the
+// waypoint endpoints take).
+function currentDays() {
+    const r = getDateRange();
+    if (!r.start || !r.end || isNaN(r.start) || isNaN(r.end)) return 7;
+    return Math.min(365, Math.max(1, Math.ceil((r.end - r.start) / 86400000)));
+}
+
+// Quadratic bezier from a to b, bowed to a fixed side so reciprocal edges
+// (A→B and B→A) separate visually instead of overlapping.
+function curvedEdge(a, b) {
+    const mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2;
+    const dx = b[0] - a[0], dy = b[1] - a[1];
+    const cx = mx - dy * 0.2, cy = my + dx * 0.2;
+    const pts = [];
+    for (let s = 0; s <= 20; s++) {
+        const t = s / 20, u = 1 - t;
+        pts.push([u * u * a[0] + 2 * u * t * cx + t * t * b[0],
+                  u * u * a[1] + 2 * u * t * cy + t * t * b[1]]);
+    }
+    return pts;
+}
+
+// Popup content for a waypoint marker: totals, last visit, a 24-hour dwell
+// histogram, and a rename button (posts to PUT /api/waypoints/{id}).
+function waypointPopupHtml(wp) {
+    const hours = wp.hours || [];
+    const max = Math.max(1, ...hours);
+    const bars = hours.map((v, h) =>
+        `<div title="${h}:00 — ${(v / 3600).toFixed(1)} h" `
+        + `style="flex:1;height:${Math.max(4, Math.round(v / max * 100))}%;`
+        + `background:#16181D;border-radius:1px;opacity:${v > 0 ? 1 : 0.12}"></div>`
+    ).join('');
+    return `<div class="wp-popup">
+        <div class="wp-title">${escapeHtml(wp.name)}</div>
+        <div class="wp-row-line"><span>Total</span><b>${(wp.dwell_seconds / 3600).toFixed(1)} h</b></div>
+        <div class="wp-row-line"><span>Share</span><b>${Math.round((wp.share || 0) * 100)}%</b></div>
+        <div class="wp-row-line"><span>Visits</span><b>${wp.visits}</b></div>
+        <div class="wp-row-line"><span>Last visit</span><b>${relativeTime(new Date(wp.last_visit))}</b></div>
+        <div class="wp-hist">${bars}</div>
+        <div class="wp-hist-labels"><span>0</span><span>6</span><span>12</span><span>18</span><span>24</span></div>
+        <button class="wp-rename" onclick="renameWaypoint(${wp.id})">Rename</button>
+    </div>`;
+}
+
+// Draw one tracker's waypoint markers (sized by dwell share, cat accent color)
+// and, when enabled, its transition graph as curved directed edges whose width
+// tracks the transition probability.
+function renderWaypointLayer(id) {
+    if (waypointMarkers[id]) { map.removeLayer(waypointMarkers[id]); delete waypointMarkers[id]; }
+    if (routeLayers[id]) { map.removeLayer(routeLayers[id]); delete routeLayers[id]; }
+    if (!map) return;
+
+    const wps = waypointsByTracker[id] || [];
+    if (wps.length === 0) return;
+    const accent = accentForIndex(trackerPaletteIndex(id)).color;
+
+    if (waypointSettings.places) {
+        const group = L.layerGroup();
+        wps.forEach(wp => {
+            L.circleMarker([wp.lat, wp.lon], {
+                radius: 6 + 14 * Math.sqrt(wp.share || 0),
+                color: '#fff',
+                weight: 2,
+                fillColor: accent,
+                fillOpacity: 0.85
+            }).addTo(group).bindPopup(waypointPopupHtml(wp));
+        });
+        group.addTo(map);
+        waypointMarkers[id] = group;
+    }
+
+    const edges = transitionsByTracker[id] || [];
+    if (waypointSettings.routes && edges.length > 0) {
+        const byId = {};
+        wps.forEach(wp => { byId[wp.id] = wp; });
+        const group = L.layerGroup();
+        edges.forEach(e => {
+            const a = byId[e.from], b = byId[e.to];
+            if (!a || !b) return;
+            const pts = curvedEdge([a.lat, a.lon], [b.lat, b.lon]);
+            L.polyline(pts, {
+                color: accent,
+                weight: 1 + 5 * e.probability,
+                opacity: 0.75
+            }).addTo(group).bindTooltip(
+                `${escapeHtml(a.name)} → ${escapeHtml(b.name)} · ${Math.round(e.probability * 100)}% (${e.count}×)`
+            );
+            // Small dot near the target end to show direction.
+            const tip = pts[Math.floor(pts.length * 0.8)];
+            L.circleMarker(tip, {
+                radius: 2.5, weight: 0, fillColor: accent, fillOpacity: 1
+            }).addTo(group);
+        });
+        group.addTo(map);
+        routeLayers[id] = group;
+    }
+}
+
+function refreshWaypointLayers() {
+    allTrackers.forEach(t => renderWaypointLayer(t.id));
+}
+
+// Sidebar "Top places" panel: per cat, the waypoints ranked by dwell share,
+// with the share change vs. the previous period as a trend arrow. Clicking a
+// row pans the map to the place.
+function renderTopPlaces() {
+    const container = document.getElementById('top-places');
+    if (!container) return;
+
+    const roster = [...allTrackers].sort((a, b) => a.id - b.id);
+    const sections = roster.map(t => {
+        const wps = (waypointsByTracker[t.id] || [])
+            .slice()
+            .sort((a, b) => b.share - a.share)
+            .slice(0, 5);
+        if (wps.length === 0) return '';
+        const accent = accentForIndex(trackerPaletteIndex(t.id)).color;
+        const rows = wps.map(wp => {
+            const delta = (wp.share || 0) - (wp.prev_share || 0);
+            let trend = '<span class="place-trend trend-flat">–</span>';
+            if (delta > 0.02) {
+                trend = `<span class="place-trend trend-up">▲${Math.round(delta * 100)}</span>`;
+            } else if (delta < -0.02) {
+                trend = `<span class="place-trend trend-down">▼${Math.round(-delta * 100)}</span>`;
+            }
+            return `<div class="place-row" data-lat="${wp.lat}" data-lon="${wp.lon}">
+                <span class="place-dot" style="background:${accent}"></span>
+                <span class="place-name">${escapeHtml(wp.name)}</span>
+                <span class="place-share mono">${Math.round((wp.share || 0) * 100)}%</span>
+                ${trend}
+            </div>`;
+        }).join('');
+        return `<div class="place-card">
+            <div class="place-cat" style="color:${accent}">${escapeHtml(t.name)}</div>${rows}
+        </div>`;
+    }).filter(Boolean).join('');
+
+    container.innerHTML = sections
+        ? `<div><div class="section-label">Top places · ${currentDays()}d</div></div>${sections}`
+        : '';
+
+    container.querySelectorAll('.place-row').forEach(row => {
+        row.addEventListener('click', () => {
+            if (map) map.setView([+row.dataset.lat, +row.dataset.lon], 18);
+        });
+    });
+}
+
+// Fetch waypoints and transitions for every tracker and refresh the layers
+// and panel. Swallows per-tracker errors — a cat without data just gets no
+// waypoints.
+async function loadWaypoints() {
+    if (allTrackers.length === 0) return;
+    const days = currentDays();
+
+    await Promise.all(allTrackers.map(async t => {
+        try {
+            const [wpRes, trRes] = await Promise.all([
+                fetch(`${API_BASE}/api/waypoints?tracker_id=${t.id}&days=${days}`)
+                    .then(r => r.ok ? r.json() : { waypoints: [] }),
+                fetch(`${API_BASE}/api/waypoints/transitions?tracker_id=${t.id}&days=${days}`)
+                    .then(r => r.ok ? r.json() : { edges: [] })
+            ]);
+            waypointsByTracker[t.id] = wpRes.waypoints || [];
+            transitionsByTracker[t.id] = trRes.edges || [];
+            renderWaypointLayer(t.id);
+        } catch (err) {
+            console.error(`Failed to load waypoints for tracker ${t.id}:`, err);
+        }
+    }));
+
+    renderTopPlaces();
+}
+
+// Prompt for a waypoint name and persist it. Empty input clears the name back
+// to the auto-label. Invoked from the popup's Rename button.
+async function renameWaypoint(id) {
+    let current = '';
+    for (const wps of Object.values(waypointsByTracker)) {
+        const wp = wps.find(w => w.id === id);
+        if (wp) { current = wp.named ? wp.name : ''; break; }
+    }
+
+    const name = prompt('Name this place (leave empty to reset to the auto-label):', current);
+    if (name === null) return;
+
+    try {
+        const res = await fetch(`${API_BASE}/api/waypoints/${id}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: name.trim() })
+        });
+        if (!res.ok) throw new Error(`Rename failed: ${res.statusText}`);
+        if (map) map.closePopup();
+        loadWaypoints();
+    } catch (err) {
+        console.error('Error renaming waypoint:', err);
+        showError(err.message || 'Rename failed');
+    }
+}
+
 // Derive heat-map settings from the current map zoom and point density, used
 // when "Auto-tune" is on. Radius/blur are pixel values, so they track zoom;
 // intensity per point falls as the total point count rises, so dense ranges
@@ -735,6 +952,7 @@ async function loadAllTrackerData() {
         renderHeatMaps(isFirstLoad);
         renderCatCards();
         updateMeta();
+        loadWaypoints();
 
         setLoading(false);
         applyAutoUIState();
@@ -829,6 +1047,27 @@ function setupEventListeners() {
         });
     }
 
+    // Waypoint layer toggles: re-render from cached data, no refetch.
+    const placesToggle = document.getElementById('places-toggle');
+    if (placesToggle) {
+        placesToggle.addEventListener('click', () => {
+            waypointSettings.places = !waypointSettings.places;
+            placesToggle.classList.toggle('on', waypointSettings.places);
+            placesToggle.setAttribute('aria-checked', String(waypointSettings.places));
+            refreshWaypointLayers();
+        });
+    }
+
+    const routesToggle = document.getElementById('routes-toggle');
+    if (routesToggle) {
+        routesToggle.addEventListener('click', () => {
+            waypointSettings.routes = !waypointSettings.routes;
+            routesToggle.classList.toggle('on', waypointSettings.routes);
+            routesToggle.setAttribute('aria-checked', String(waypointSettings.routes));
+            refreshWaypointLayers();
+        });
+    }
+
     // Heat map setting sliders — re-render with cached positions, no refetch.
     // Only active while Auto-tune is off (the group is inert otherwise).
     document.getElementById('intensity-slider').addEventListener('input', (e) => {
@@ -860,6 +1099,7 @@ function initLiveUpdates() {
             if (e.data === 'connected') return;
             loadAllTrackerData();
             loadActivity();
+            loadWaypoints();
         });
     } catch (err) {
         console.error('Live updates unavailable:', err);

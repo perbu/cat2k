@@ -79,15 +79,27 @@ Key methods:
 - `fetchAndStorePositions()` - Internal method that handles 24h chunking
 
 ### database.go
-SQLite operations using modernc.org/sqlite driver. Three tables:
+SQLite operations using modernc.org/sqlite driver. Four tables:
 - `trackers` - Tracker metadata with `last_sync_timestamp`
 - `positions` - GPS positions (idempotent inserts by position ID)
 - `sync_log` - Sync operation history
+- `waypoints` - Dwell-point waypoint identity + user-assigned names (issue #2); clustering itself is recomputed on demand, this table only makes names stick
 
 Key methods:
 - `GetLatestPositions()` - Returns most recent position per tracker (used by status page)
+- `GetPositionsForDwell()` - Gate-eligible fields for a tracker over a time range, ordered by timestamp
 
 All position inserts use `ON CONFLICT(id) DO UPDATE` on the extended quality/presence columns (radius, pdop, wifi_zone_id, …) so a re-backfill backfills them into historical rows; the insert stays idempotent because position IDs are stable. A migration in initDatabase adds the columns to pre-existing databases.
+
+### gate.go
+Shared fix-quality gate (`ClassifyFix`): fixes are `FixInvalid` (no valid signal), `FixHome` (snapped CMD-X WiFi-zone fixes — "at home" evidence only), or `FixGPS` (usable for movement analytics). All analytics must pass fixes through this gate; `FixHome` coordinates are snapped to the zone center and fabricate stillness.
+
+### dwell.go
+Dwell-point waypoints and territory transition graph (issue #2):
+- `detectDwellEpisodes()` groups consecutive gated GPS fixes within 30 m of an anchor into stationary episodes (min 3 min span, max 20 min fix gap)
+- `dbscanEpisodes()` clusters episode centroids (epsilon 20 m, minPoints 1, pure Go, O(n²))
+- `computeWaypoints()` aggregates clusters (dwell time, visits, hour-of-day histogram, last visit, share + previous-period share) and reconciles them with the `waypoints` table by centroid proximity (40 m match radius) so user names survive recomputation; unnamed waypoints get rank-based auto-labels ("Waypoint 1" = most dwelt)
+- Transitions between consecutive episodes in different clusters form the directed territory graph
 
 ### scheduler.go
 Cron-based scheduling using github.com/robfig/cron/v3. Runs sync jobs on configured schedule with graceful shutdown support.
@@ -103,10 +115,23 @@ HTTP API server providing:
 - `GET /api/trackers` - List all trackers with position counts
 - `GET /api/positions/{id}` - Get positions for a tracker (with date range query params)
 - `GET /api/status` - Radar status endpoint returning latest positions, home coords, POIs, and SureHub pet status
+- `GET /api/activity` - Per-cat daily activity summary
+- `GET /api/waypoints?tracker_id=&days=` - Detected dwell-point waypoints with centroid, dwell time, share (+ previous period), visits, hour-of-day histogram, last visit, and name (stored or auto-label)
+- `GET /api/waypoints/transitions?tracker_id=&days=` - Directed territory-graph edges `{from, to, count, probability}`
+- `PUT /api/waypoints/{id}` - Assign or clear a waypoint's user name (JSON body `{"name": "..."}`)
+- `POST /api/sync` - Manual upstream resync
+- `GET /api/events` - SSE stream notifying browsers when fresh data lands
 - `GET /health` - Health check endpoint
 - Static file serving from `./web` directory
 
 The `/api/status` endpoint integrates with SureHub (github.com/perbu/go-sure) to fetch pet inside/outside status. Results are cached for 5 minutes to avoid excessive API calls.
+
+### web/index.html + web/app.js
+Leaflet map view: per-cat heatmaps, recent-movement trails, activity cat cards,
+plus the waypoint layer (markers sized by dwell share, per-cat accent colors,
+click for stats popup with rename), the toggleable transition-graph overlay
+(curved directed edges, width ∝ probability), and a "Top places" sidebar panel
+ranking waypoints by dwell share with a trend vs. the previous period.
 
 ### web/status.html
 Radar-style status page showing:
