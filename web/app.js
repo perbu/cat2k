@@ -850,10 +850,17 @@ function ringsToLatLngs(rings) {
     return (rings || []).map(ring => ring.map(([lon, lat]) => [lat, lon]));
 }
 
-// Draw one tracker's contour pair: 95% home range as a thin outline with a
-// faint fill, 50% core as a stronger fill in the cat's accent color. With two
-// cats enabled the translucent home fills blend where they overlap, which
-// reads as the shared territory — no polygon clipping needed.
+// Draw one tracker's contour pair: 95% home range as a thin dotted outline
+// with a faint fill, 50% core as a stronger fill in the cat's accent color.
+// The outlines are dotted so they don't read as movement tracks (issue:
+// solid rings collided visually with the trail polylines). With two cats
+// enabled the translucent home fills blend where they overlap, which reads
+// as the shared territory — no polygon clipping needed.
+// The group must be a FeatureGroup, not a LayerGroup: only FeatureGroup
+// propagates child mouse events, and Layer.openTooltip overwrites the
+// tooltip source with the group itself for plain LayerGroups, which lack
+// getCenter/getLatLng/getBounds — Leaflet then throws "Unable to get
+// source layer LatLng" whenever a contour polygon receives focus.
 function renderRangeLayer(id) {
     if (rangeLayers[id]) { map.removeLayer(rangeLayers[id]); delete rangeLayers[id]; }
     if (!map || !rangeSettings.enabled || rangeSettings.cats[id] === false) return;
@@ -862,18 +869,20 @@ function renderRangeLayer(id) {
     if (!data) return;
     const accent = accentForIndex(trackerPaletteIndex(id)).color;
 
-    const group = L.layerGroup();
+    const group = L.featureGroup();
     const home = ringsToLatLngs(data.home);
     const core = ringsToLatLngs(data.core);
     home.forEach(latlngs => {
         L.polygon(latlngs, {
             color: accent, weight: 2, opacity: 0.9,
+            dashArray: '1 7', lineCap: 'round',
             fillColor: accent, fillOpacity: 0.07
         }).addTo(group);
     });
     core.forEach(latlngs => {
         L.polygon(latlngs, {
-            color: accent, weight: 1, opacity: 0.8,
+            color: accent, weight: 2, opacity: 0.8,
+            dashArray: '1 5', lineCap: 'round',
             fillColor: accent, fillOpacity: 0.35
         }).addTo(group);
     });

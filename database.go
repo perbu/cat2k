@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -239,7 +240,21 @@ func initDatabase(dbPath string) (*Database, error) {
 		return nil, err
 	}
 
-	db, err := sql.Open("sqlite", dbPath)
+	// Pragmas via the DSN: the driver applies them to every pooled
+	// connection (a one-shot PRAGMA via Exec would only affect the first).
+	// WAL lets readers run alongside the single writer, and busy_timeout
+	// turns SQLITE_BUSY ("database is locked") into a wait — concurrent
+	// HTTP API requests otherwise fail intermittently with 500s whenever a
+	// sync or waypoint reconciliation writes.
+	dsn := dbPath
+	if strings.Contains(dsn, "?") {
+		dsn += "&"
+	} else {
+		dsn += "?"
+	}
+	dsn += "_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)"
+
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
