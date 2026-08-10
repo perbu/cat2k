@@ -80,6 +80,14 @@ let behaviorLayers = {};         // trackerId -> L.layerGroup of state-colored s
 let behaviorSettings = {
     tracks: false                // color tracks by rest/forage/transit state
 };
+let proximityData = null;        // /api/proximity response for the selected day
+let shiftData = null;            // /api/proximity/shifts response
+let leadFollowData = null;       // /api/proximity/leadfollow response
+let togetherLayer = null;        // L.layerGroup of together-episode segments
+let proximitySettings = {
+    overlay: false,              // together-episode paired segments on the map
+    date: null                   // YYYY-MM-DD, initialized to today
+};
 
 function paletteForIndex(idx) {
     return HEATMAP_PALETTES[idx % HEATMAP_PALETTES.length];
@@ -1312,6 +1320,232 @@ function renderBehaviorMatrix() {
         : '';
 }
 
+// ----- Inter-cat proximity: distance series, together episodes, shifts, lead/follow (issue #6) -----
+
+const PROXIMITY_SHIFT_DAYS = 7;
+const PROXIMITY_LEADFOLLOW_DAYS = 30;
+
+// Local YYYY-MM-DD for the date input (toISOString would give UTC).
+function localDateStr(d) {
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// Fetch the proximity trio — distance series + together episodes for the
+// selected day, the patrol-shift grid, and the lead/follow stats — then
+// re-render the chart, map overlay, and panels. Swallows errors; stale
+// panels stay as they are.
+async function loadProximity() {
+    if (allTrackers.length < 2) return;
+    const date = proximitySettings.date || localDateStr(new Date());
+    try {
+        const [pRes, sRes, lRes] = await Promise.all([
+            fetch(`${API_BASE}/api/proximity?date=${date}`).then(r => r.ok ? r.json() : null),
+            fetch(`${API_BASE}/api/proximity/shifts?days=${PROXIMITY_SHIFT_DAYS}`).then(r => r.ok ? r.json() : null),
+            fetch(`${API_BASE}/api/proximity/leadfollow?days=${PROXIMITY_LEADFOLLOW_DAYS}`).then(r => r.ok ? r.json() : null)
+        ]);
+        proximityData = pRes;
+        shiftData = sRes;
+        leadFollowData = lRes;
+    } catch (err) {
+        console.error('Failed to load proximity data:', err);
+    }
+    drawProximityChart();
+    renderTogetherLayer();
+    renderShiftGrid();
+    renderLeadFollow();
+}
+
+// Distance-over-time chart for the selected day: log-scale y (1 m–1 km; the
+// interesting range is 0–100 m), together episodes shaded behind the line,
+// coverage gaps breaking the line, and a dashed rule at the together
+// threshold.
+function drawProximityChart() {
+    const canvas = document.getElementById('proximity-chart');
+    if (!canvas) return;
+    const empty = document.getElementById('proximity-empty');
+
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, w, h);
+
+    const data = proximityData;
+    const series = data?.series || [];
+    if (empty) empty.style.display = series.length ? 'none' : 'block';
+    if (!data || series.length === 0 || w === 0) return;
+
+    const from = new Date(data.from).getTime();
+    const to = new Date(data.to).getTime();
+    const xms = (ms) => (ms - from) / (to - from) * w;
+    const x = (t) => xms(new Date(t).getTime());
+
+    // Log10 scale clamped to [1 m, 1 km], 4px padding top and bottom.
+    const y = (m) => {
+        const v = Math.min(3, Math.max(0, Math.log10(Math.max(1, m))));
+        return h - 4 - (v / 3) * (h - 8);
+    };
+
+    // Together episodes shaded behind everything else.
+    ctx.fillStyle = 'rgba(22,24,29,0.08)';
+    (data.episodes || []).forEach(ep => {
+        const x0 = x(ep.start), x1 = Math.max(x(ep.end), x0 + 2);
+        ctx.fillRect(x0, 0, x1 - x0, h);
+    });
+
+    // Grid lines + labels (right edge) at 1 m / 10 m / 100 m / 1 km.
+    ctx.font = '9px "JetBrains Mono", monospace';
+    ['1m', '10m', '100m', '1km'].forEach((label, i) => {
+        const gy = y(Math.pow(10, i));
+        ctx.strokeStyle = '#EEF0F2';
+        ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(w, gy); ctx.stroke();
+        ctx.fillStyle = '#B4BAC2';
+        ctx.textAlign = 'right';
+        ctx.fillText(label, w - 2, gy - 2);
+    });
+
+    // Together threshold, dashed.
+    ctx.strokeStyle = '#B4BAC2';
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(0, y(data.together_threshold_m || 20));
+    ctx.lineTo(w, y(data.together_threshold_m || 20));
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Distance line, breaking across coverage gaps (> 2 grid steps).
+    const stepMs = (data.grid_step_s || 60) * 1000;
+    ctx.strokeStyle = '#16181D';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    let pen = false;
+    let prevT = 0;
+    series.forEach(p => {
+        const t = new Date(p.t).getTime();
+        if (!pen || t - prevT > 2 * stepMs) {
+            ctx.moveTo(xms(t), y(p.distance_m));
+        } else {
+            ctx.lineTo(xms(t), y(p.distance_m));
+        }
+        pen = true;
+        prevT = t;
+    });
+    ctx.stroke();
+
+    // Hour ticks.
+    ctx.fillStyle = '#9198A2';
+    for (let hh = 0; hh <= 24; hh += 6) {
+        ctx.textAlign = hh === 0 ? 'left' : hh === 24 ? 'right' : 'center';
+        ctx.fillText(String(hh), xms(from + hh * 3600000), h - 1);
+    }
+}
+
+// Draw the together episodes as paired trajectory segments, one polyline per
+// cat in its accent color. Straight segments: the points are interpolated
+// grid positions, so corners carry no extra meaning.
+function renderTogetherLayer() {
+    if (togetherLayer) { map.removeLayer(togetherLayer); togetherLayer = null; }
+    if (!map || !proximitySettings.overlay) return;
+
+    const eps = proximityData?.episodes || [];
+    // The server's proximity pair is the first two trackers in roster
+    // (name) order — the same order /api/trackers returned.
+    const cats = allTrackers.slice(0, 2);
+    if (eps.length === 0 || cats.length < 2) return;
+
+    const colorA = accentForIndex(trackerPaletteIndex(cats[0].id)).color;
+    const colorB = accentForIndex(trackerPaletteIndex(cats[1].id)).color;
+    const timeOpt = { hour: '2-digit', minute: '2-digit' };
+
+    const group = L.layerGroup();
+    eps.forEach(ep => {
+        const tip = `together ${new Date(ep.start).toLocaleTimeString([], timeOpt)}`
+            + ` – ${new Date(ep.end).toLocaleTimeString([], timeOpt)} · ${formatDurationS(ep.duration_s)}`;
+        if (ep.points_a?.length > 1) {
+            L.polyline(ep.points_a, { color: colorA, weight: 5, opacity: 0.85, lineCap: 'round' })
+                .addTo(group).bindTooltip(tip);
+        }
+        if (ep.points_b?.length > 1) {
+            L.polyline(ep.points_b, { color: colorB, weight: 5, opacity: 0.85, lineCap: 'round' })
+                .addTo(group).bindTooltip(tip);
+        }
+    });
+    if (group.getLayers().length === 0) return;
+    group.addTo(map);
+    togetherLayer = group;
+}
+
+// Patrol-shift grid: one row per day (oldest first, today last), 24 hourly
+// cells colored by who was out, from the WiFi-zone presence intervals.
+function renderShiftGrid() {
+    const container = document.getElementById('shift-grid');
+    const legend = document.getElementById('shift-legend');
+    if (!container) return;
+
+    const grid = shiftData?.grid || [];
+    const cats = shiftData?.cats || [];
+    if (grid.length === 0 || cats.length < 2) {
+        container.innerHTML = '<div class="panel-empty">Needs two cats with WiFi-zone data.</div>';
+        if (legend) legend.innerHTML = '';
+        return;
+    }
+
+    const nameA = escapeHtml(cats[0].name), nameB = escapeHtml(cats[1].name);
+    const colorA = accentForIndex(trackerPaletteIndex(cats[0].id)).color;
+    const colorB = accentForIndex(trackerPaletteIndex(cats[1].id)).color;
+    const cellColor = { a: colorA, b: colorB, both: '#16181D', neither: '#DFE3E7', nodata: '#FFFFFF' };
+    const cellLabel = {
+        a: `${nameA} out`, b: `${nameB} out`, both: 'both out',
+        neither: 'both home', nodata: 'no data'
+    };
+
+    const rows = grid.map((d, i) => {
+        const isToday = i === grid.length - 1;
+        const label = isToday ? 'Today'
+            : new Date(d.date + 'T00:00:00').toLocaleDateString(undefined, { weekday: 'short' });
+        const cells = (d.hours || []).map((state, hh) =>
+            `<div class="shift-cell${state === 'nodata' ? ' nodata' : ''}" style="background:${cellColor[state] || cellColor.nodata}" title="${d.date} ${hh}:00 — ${cellLabel[state] || state}"></div>`
+        ).join('');
+        return `<div class="shift-row${isToday ? ' today' : ''}">
+            <span class="shift-day">${label}</span>
+            <div class="shift-cells">${cells}</div>
+        </div>`;
+    }).join('');
+
+    container.innerHTML = rows
+        + '<div class="presence-ticks"><span>0</span><span>6</span><span>12</span><span>18</span><span>24</span></div>';
+
+    if (legend) {
+        legend.innerHTML = `
+            <span><span class="legend-swatch" style="background:${colorA}"></span>${nameA} out</span>
+            <span><span class="legend-swatch" style="background:${colorB}"></span>${nameB} out</span>
+            <span><span class="legend-swatch" style="background:#16181D"></span>Both out</span>
+            <span><span class="legend-swatch" style="background:#DFE3E7"></span>Both home</span>`;
+    }
+}
+
+// Lead/follow stat card: one line per direction ("B follows A within 10 min
+// in 34% of departures").
+function renderLeadFollow() {
+    const container = document.getElementById('leadfollow-body');
+    if (!container) return;
+
+    const dirs = leadFollowData?.directions || [];
+    if (dirs.length === 0) {
+        container.innerHTML = '<div class="panel-empty">Needs two cats with WiFi-zone data.</div>';
+        return;
+    }
+    const winMin = Math.round((leadFollowData.follow_window_s || 600) / 60);
+    container.innerHTML = dirs.map(d => {
+        if (d.departures === 0) {
+            return `<div class="lf-line"><b>${escapeHtml(d.follower)}</b> hasn't followed <b>${escapeHtml(d.leader)}</b> out — no eligible departures.</div>`;
+        }
+        return `<div class="lf-line"><b>${escapeHtml(d.follower)}</b> follows <b>${escapeHtml(d.leader)}</b> within ${winMin} min in <b class="mono">${Math.round(d.share * 100)}%</b> of departures (${d.followed}/${d.departures}).</div>`;
+    }).join('');
+}
+
 // Derive heat-map settings from the current map zoom and point density, used// when "Auto-tune" is on. Radius/blur are pixel values, so they track zoom;
 // intensity per point falls as the total point count rises, so dense ranges
 // don't wash out to solid colour. Mutates heatMapSettings and syncs the (view-
@@ -1584,6 +1818,27 @@ function setupEventListeners() {
         });
     }
 
+    // Together-episode overlay toggle: re-render from cached data, no refetch.
+    const togetherToggle = document.getElementById('together-toggle');
+    if (togetherToggle) {
+        togetherToggle.addEventListener('click', () => {
+            proximitySettings.overlay = !proximitySettings.overlay;
+            togetherToggle.classList.toggle('on', proximitySettings.overlay);
+            togetherToggle.setAttribute('aria-checked', String(proximitySettings.overlay));
+            renderTogetherLayer();
+        });
+    }
+
+    // Proximity day picker: refetch the distance series + together episodes.
+    const proxDate = document.getElementById('proximity-date');
+    if (proxDate) {
+        proxDate.addEventListener('change', () => {
+            if (!proxDate.value) return;
+            proximitySettings.date = proxDate.value;
+            loadProximity();
+        });
+    }
+
     // Month picker: step the contour layer (and chart highlight) through
     // monthly windows.
     const monthInput = document.getElementById('range-month');
@@ -1648,6 +1903,7 @@ function initLiveUpdates() {
             loadOverlap();
             loadPresence();
             loadBehavior();
+            loadProximity();
         });
     } catch (err) {
         console.error('Live updates unavailable:', err);
@@ -1677,12 +1933,18 @@ async function init() {
         const monthInput = document.getElementById('range-month');
         if (monthInput) monthInput.value = rangeSettings.month;
 
+        // Default the proximity day picker to today (local).
+        proximitySettings.date = localDateStr(now);
+        const proxDateInput = document.getElementById('proximity-date');
+        if (proxDateInput) proxDateInput.value = proximitySettings.date;
+
         renderCatCards();   // identity/status skeleton before data arrives
         renderRangeCatToggles();
         loadActivity();
         loadPOIs();
         loadOverlap();
         loadPresence();
+        loadProximity();
 
         await loadAllTrackerData();
         loadRanges();

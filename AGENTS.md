@@ -127,6 +127,13 @@ HMM behavioral segmentation — rest / forage / transit (issue #5):
 - Fitted params persist as JSON in `behavior_models`; `behaviorModel()` refits on demand when the model is missing or older than 7 days (stale model keeps serving if a refit lacks data; no model at all → endpoints report `model_ready: false`)
 - `viterbiHMM()` decodes request windows against the stored params; every step counts 60s of its state for the per-day budget and hour-of-day share matrix
 
+### proximity.go
+Inter-cat proximity — together-episodes, patrol shifts, lead/follow (issue #6); always analyzes the first two trackers in roster order (same pair as `/api/range/overlap`):
+- The collars don't sample at aligned timestamps, so both gated tracks (FixGPS only, shared equirectangular frame around the joint centroid) are interpolated onto a shared 60s grid; a grid point is filled only when its bracketing fixes are ≤ `proxMaxInterpGapS` (3 min) apart, so neither the distance series nor an episode ever spans a signal gap
+- `proximitySeries()` emits the inter-cat distance per grid point where both cats have data and segments close runs (< `proxTogetherDistM` = 20 m, sustained ≥ `proxTogetherMinDurS` = 5 min) into together-episodes carrying both cats' decimated `[lat,lon]` segments for the map
+- `computeShiftGrid()` buckets both cats' presence intervals (reused from presence.go) into day × hour cells (neither / a / both / b / nodata); a cat is "out" for an hour when its away coverage beats its home coverage, and hours where either cat lacks zone data are nodata, never fabricated
+- Lead/follow statistic: the departure-follow fraction — of the leader's excursions (away intervals) where the follower was verifiably home at departure time, the share where the follower left the home zone within `followWindowS` (10 min); excursions where the follower was already out or unknown are ineligible. Chosen over movement-vector cross-correlation: it needs no aligned movement data and matches the question owners ask
+
 ### scheduler.go
 Cron-based scheduling using github.com/robfig/cron/v3. Runs sync jobs on configured schedule with graceful shutdown support.
 
@@ -152,6 +159,9 @@ HTTP API server providing:
 - `GET /api/behavior/segments?tracker_id=&from=&to=` (RFC3339, default last 24h) - Viterbi-decoded 60s steps `{t, from, to, state, step_m}` for state-colored tracks; capped at 10000 steps (most recent kept, `truncated` flag), `model_ready: false` when no HMM could be fitted yet
 - `GET /api/behavior/budget?tracker_id=&days=7` - Per-day decoded seconds per state (`rest_s`/`forage_s`/`transit_s`) for stacked-bar budgets
 - `GET /api/behavior/matrix?tracker_id=&days=30` - 24×3 hour-of-day × state share matrix
+- `GET /api/proximity?date=YYYY-MM-DD` (or `from`/`to` RFC3339, max 48h; default today) - inter-cat distance series `[{t, distance_m}]` on the shared 60s grid plus together-episodes `[{start, end, duration_s, points_a, points_b}]` with both cats' paired track segments
+- `GET /api/proximity/shifts?days=7` - patrol-shift grid: per-day 24 hourly cells (`neither`/`a`/`both`/`b`/`nodata`) of which cat was out, from presence intervals
+- `GET /api/proximity/leadfollow?days=30` - both directions of the departure-follow statistic `{leader, follower, departures, followed, share}` with `follow_window_s`
 - `POST /api/sync` - Manual upstream resync
 - `GET /api/events` - SSE stream notifying browsers when fresh data lands
 - `GET /health` - Health check endpoint
@@ -175,7 +185,13 @@ The "Behavior" card (issue #5) toggles state-colored tracks on the map
 (blue rest / amber forage / red transit, straight segments so state
 boundaries stay exact) and shows the per-cat "Activity budget" (stacked
 state-share column per day, last 7 days) and "State by hour" (24 stacked
-micro-bars of state share per hour of day, last 30 days).
+micro-bars of state share per hour of day, last 30 days). The "Together"
+card (issue #6) charts the inter-cat distance for a selectable day (log
+scale, together episodes shaded, dashed threshold rule) and toggles the
+together-episode overlay (paired segments in both cats' accent colors); the
+"Patrol shifts" card shows the 24h × 7d grid of who was out (per-cat accents,
+ink for both, gray for both home, hollow for no data); the "Lead / follow"
+card states both directions of the departure-follow share.
 
 ### web/status.html
 Radar-style status page showing:

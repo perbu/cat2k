@@ -229,7 +229,8 @@
         }
 
         .date-inputs input[type="date"],
-        .range-month-input input[type="month"] {
+        .range-month-input input[type="month"],
+        .prox-date input[type="date"] {
             width: 100%;
             padding: 9px 11px;
             border: 1px solid var(--card-border);
@@ -241,7 +242,8 @@
         }
 
         .date-inputs input[type="date"]:focus,
-        .range-month-input input[type="month"]:focus {
+        .range-month-input input[type="month"]:focus,
+        .prox-date input[type="date"]:focus {
             outline: none;
             border-color: var(--ink);
         }
@@ -515,6 +517,54 @@
             color: var(--text-3);
             margin-top: 10px;
         }
+
+        /* ---------- Inter-cat proximity (issue #6) ---------- */
+        .prox-date { margin-top: 12px; }
+
+        #proximity-chart {
+            width: 100%;
+            height: 110px;
+            margin-top: 10px;
+        }
+
+        .shift-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin: 3px 0;
+        }
+
+        .shift-day {
+            width: 34px;
+            flex-shrink: 0;
+            font-size: 10.5px;
+            color: var(--text-3);
+        }
+
+        .shift-row.today .shift-day { font-weight: 700; color: var(--text-2); }
+
+        .shift-cells {
+            flex: 1;
+            display: flex;
+            gap: 1px;
+        }
+
+        .shift-cell {
+            flex: 1;
+            height: 12px;
+            border-radius: 2px;
+        }
+
+        .shift-cell.nodata { box-shadow: inset 0 0 0 1px var(--card-border); }
+
+        .lf-line {
+            margin-top: 8px;
+            font-size: 12.5px;
+            line-height: 1.6;
+            color: var(--text-2);
+        }
+
+        .lf-line b { color: var(--ink); font-weight: 600; }
 
         /* ---------- Cat cards ---------- */
         #cat-cards {
@@ -1182,6 +1232,47 @@
                     <span><span class="legend-swatch" style="background:#F59E0B"></span>Forage</span>
                     <span><span class="legend-swatch" style="background:#EF4444"></span>Transit</span>
                 </div>
+            </div>
+
+            <!-- Inter-cat proximity: distance chart + together overlay (issue #6) -->
+            <div class="heatmap-card" id="proximity-card">
+                <div class="heatmap-head">
+                    <div>
+                        <div class="card-title">Together</div>
+                        <div class="card-sub">Inter-cat distance, log scale</div>
+                    </div>
+                    <button class="toggle" id="together-toggle" role="switch" aria-checked="false" aria-label="Show together episodes on the map">
+                        <span class="knob"></span>
+                    </button>
+                </div>
+                <div class="prox-date">
+                    <input type="date" id="proximity-date" aria-label="Proximity day">
+                </div>
+                <canvas id="proximity-chart"></canvas>
+                <div class="overlap-empty" id="proximity-empty" style="display:none">No overlapping GPS coverage this day.</div>
+            </div>
+
+            <!-- Patrol shifts (issue #6) -->
+            <div class="heatmap-card" id="shifts-card">
+                <div class="heatmap-head">
+                    <div>
+                        <div class="card-title">Patrol shifts</div>
+                        <div class="card-sub">Who was out, hour by hour · 7d</div>
+                    </div>
+                </div>
+                <div id="shift-grid" style="margin-top:12px"></div>
+                <div class="presence-legend" id="shift-legend"></div>
+            </div>
+
+            <!-- Lead / follow (issue #6) -->
+            <div class="heatmap-card" id="leadfollow-card">
+                <div class="heatmap-head">
+                    <div>
+                        <div class="card-title">Lead / follow</div>
+                        <div class="card-sub">Does one cat trail the other out? · 30d</div>
+                    </div>
+                </div>
+                <div id="leadfollow-body"></div>
             </div>
 
             <!-- Top places -->

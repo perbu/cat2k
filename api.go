@@ -73,6 +73,9 @@ func NewAPIServer(db *Database, cfg *Config, worker *SyncWorker, listenAddr stri
 	mux.HandleFunc("/api/behavior/segments", api.handleGetBehaviorSegments)
 	mux.HandleFunc("/api/behavior/budget", api.handleGetBehaviorBudget)
 	mux.HandleFunc("/api/behavior/matrix", api.handleGetBehaviorMatrix)
+	mux.HandleFunc("/api/proximity", api.handleGetProximity)
+	mux.HandleFunc("/api/proximity/shifts", api.handleGetShifts)
+	mux.HandleFunc("/api/proximity/leadfollow", api.handleGetLeadFollow)
 	mux.HandleFunc("/api/events", api.handleEvents)
 	mux.HandleFunc("/api/sync", api.handleSync)
 	mux.HandleFunc("/health", api.handleHealth)
@@ -1412,6 +1415,288 @@ func (a *APIServer) handleGetBehaviorMatrix(w http.ResponseWriter, r *http.Reque
 	}
 
 	resp.Matrix = behaviorHourMatrix(segs, decoded, a.activityLocation())
+	a.writeJSON(w, http.StatusOK, resp)
+}
+
+// ProximityResponse represents the /api/proximity response: the inter-cat
+// distance series plus together-episodes for one window (issue #6).
+type ProximityResponse struct {
+	From            time.Time         `json:"from"`
+	To              time.Time         `json:"to"`
+	GridStepS       float64           `json:"grid_step_s"`
+	TogetherDistM   float64           `json:"together_threshold_m"`
+	TogetherMinDurS float64           `json:"together_min_duration_s"`
+	Series          []DistancePoint   `json:"series"`
+	Episodes        []TogetherEpisode `json:"episodes"`
+}
+
+// ShiftsResponse represents the /api/proximity/shifts response: the
+// day x hour patrol-shift grid (issue #6).
+type ShiftsResponse struct {
+	Days int        `json:"days"`
+	Cats []ShiftCat `json:"cats"` // index 0 is cell state "a", 1 is "b"
+	Grid []ShiftDay `json:"grid"`
+}
+
+// ShiftCat identifies one cat of the shift grid's pair.
+type ShiftCat struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+}
+
+// LeadFollowResponse represents the /api/proximity/leadfollow response.
+type LeadFollowResponse struct {
+	Days          int          `json:"days"`
+	FollowWindowS float64      `json:"follow_window_s"`
+	Directions    []FollowStat `json:"directions"`
+}
+
+// firstTwoTrackers returns the first two trackers in roster (name) order —
+// the same pair /api/range/overlap analyzes. ok=false with fewer than two.
+func (a *APIServer) firstTwoTrackers() (catA, catB TrackerWithCount, ok bool, err error) {
+	trackers, err := a.db.GetAllTrackers()
+	if err != nil {
+		return catA, catB, false, err
+	}
+	if len(trackers) < 2 {
+		return catA, catB, false, nil
+	}
+	return trackers[0], trackers[1], true, nil
+}
+
+// parseProximityWindow resolves the window for /api/proximity: an explicit
+// date=YYYY-MM-DD (calendar day in the activity timezone) wins; otherwise
+// from/to RFC3339 (span capped at proxMaxWindowS); otherwise today.
+func (a *APIServer) parseProximityWindow(w http.ResponseWriter, r *http.Request) (from, to time.Time, ok bool) {
+	query := r.URL.Query()
+	loc := a.activityLocation()
+
+	if dateStr := query.Get("date"); dateStr != "" {
+		day, err := time.ParseInLocation("2006-01-02", dateStr, loc)
+		if err != nil {
+			a.writeError(w, http.StatusBadRequest, "Invalid date format (use YYYY-MM-DD)")
+			return from, to, false
+		}
+		return day, day.AddDate(0, 0, 1), true
+	}
+
+	if fromStr := query.Get("from"); fromStr != "" {
+		var err error
+		from, err = time.Parse(time.RFC3339, fromStr)
+		if err != nil {
+			a.writeError(w, http.StatusBadRequest, "Invalid from date format (use RFC3339)")
+			return from, to, false
+		}
+		to = time.Now()
+		if toStr := query.Get("to"); toStr != "" {
+			to, err = time.Parse(time.RFC3339, toStr)
+			if err != nil {
+				a.writeError(w, http.StatusBadRequest, "Invalid to date format (use RFC3339)")
+				return from, to, false
+			}
+		}
+		if !from.Before(to) {
+			a.writeError(w, http.StatusBadRequest, "from must be before to")
+			return from, to, false
+		}
+		if to.Sub(from).Seconds() > proxMaxWindowS {
+			a.writeError(w, http.StatusBadRequest, "Window too large (max 48h)")
+			return from, to, false
+		}
+		return from, to, true
+	}
+
+	now := time.Now().In(loc)
+	from = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+	return from, from.AddDate(0, 0, 1), true
+}
+
+// handleGetProximity handles GET /api/proximity?date=YYYY-MM-DD (or from/to,
+// default today) - the inter-cat distance series on the shared 60s grid plus
+// together-episodes with both cats' paired track segments. Distance points
+// only exist where both cats have honestly interpolated grid positions, so
+// the series (and episodes) never span a signal gap.
+func (a *APIServer) handleGetProximity(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		a.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	from, to, ok := a.parseProximityWindow(w, r)
+	if !ok {
+		return
+	}
+
+	resp := ProximityResponse{
+		From:            from,
+		To:              to,
+		GridStepS:       proxGridStepS,
+		TogetherDistM:   proxTogetherDistM,
+		TogetherMinDurS: proxTogetherMinDurS,
+		Series:          []DistancePoint{},
+		Episodes:        []TogetherEpisode{},
+	}
+
+	catA, catB, ok, err := a.firstTwoTrackers()
+	if err != nil {
+		a.logger.Error("Failed to get trackers", "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Failed to retrieve trackers")
+		return
+	}
+	if !ok {
+		a.writeJSON(w, http.StatusOK, resp)
+		return
+	}
+
+	posA, err := a.db.GetPositionsForRange(catA.ID, from, to)
+	if err != nil {
+		a.logger.Error("Failed to get positions for proximity", "tracker_id", catA.ID, "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Failed to retrieve positions")
+		return
+	}
+	posB, err := a.db.GetPositionsForRange(catB.ID, from, to)
+	if err != nil {
+		a.logger.Error("Failed to get positions for proximity", "tracker_id", catB.ID, "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Failed to retrieve positions")
+		return
+	}
+
+	// One shared projection frame around the joint centroid (same approach as
+	// the overlap endpoint), so distances come from meter arithmetic.
+	proj, _ := centroidProjection(append(posA, posB...))
+	gridA := resampleTrack(gateProximityFixes(posA, proj), from, to)
+	gridB := resampleTrack(gateProximityFixes(posB, proj), from, to)
+
+	resp.Series, resp.Episodes = proximitySeries(gridA, gridB, proj)
+	a.writeJSON(w, http.StatusOK, resp)
+}
+
+// handleGetShifts handles GET /api/proximity/shifts?days=7 - the patrol-shift
+// grid: per calendar day and hour, which cat was out (neither / a / both /
+// b / nodata), derived from the WiFi-zone presence intervals (issue #4 data).
+// Days default to 7 and follow the same calendar-day convention as
+// /api/presence.
+func (a *APIServer) handleGetShifts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		a.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	days := 7
+	if daysStr := r.URL.Query().Get("days"); daysStr != "" {
+		if d, err := strconv.Atoi(daysStr); err == nil && d >= 1 && d <= 30 {
+			days = d
+		}
+	}
+
+	catA, catB, ok, err := a.firstTwoTrackers()
+	if err != nil {
+		a.logger.Error("Failed to get trackers", "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Failed to retrieve trackers")
+		return
+	}
+
+	resp := ShiftsResponse{Days: days, Grid: []ShiftDay{}}
+	if !ok {
+		a.writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	resp.Cats = []ShiftCat{{ID: catA.ID, Name: catA.Name}, {ID: catB.ID, Name: catB.Name}}
+
+	loc := a.activityLocation()
+	today := time.Now().In(loc)
+	startOfToday := time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, loc)
+	start := startOfToday.AddDate(0, 0, -(days - 1))
+
+	dates := make([]string, days)
+	for i := 0; i < days; i++ {
+		dates[i] = start.AddDate(0, 0, i).Format("2006-01-02")
+	}
+
+	fixesA, err := a.db.GetPositionsForPresence(catA.ID, start)
+	if err != nil {
+		a.logger.Error("Failed to get presence fixes", "tracker_id", catA.ID, "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Failed to retrieve positions")
+		return
+	}
+	fixesB, err := a.db.GetPositionsForPresence(catB.ID, start)
+	if err != nil {
+		a.logger.Error("Failed to get presence fixes", "tracker_id", catB.ID, "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Failed to retrieve positions")
+		return
+	}
+
+	resp.Grid = computeShiftGrid(
+		derivePresenceIntervals(fixesA),
+		derivePresenceIntervals(fixesB),
+		dates, loc,
+	)
+	a.writeJSON(w, http.StatusOK, resp)
+}
+
+// handleGetLeadFollow handles GET /api/proximity/leadfollow?days=30 - the
+// lead/follow stat card: both directions of the departure-follow statistic
+// (see proximity.go for the exact definition). Days default to 30.
+func (a *APIServer) handleGetLeadFollow(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		a.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	days := 30
+	if daysStr := r.URL.Query().Get("days"); daysStr != "" {
+		if d, err := strconv.Atoi(daysStr); err == nil && d >= 1 && d <= 365 {
+			days = d
+		}
+	}
+
+	catA, catB, ok, err := a.firstTwoTrackers()
+	if err != nil {
+		a.logger.Error("Failed to get trackers", "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Failed to retrieve trackers")
+		return
+	}
+
+	resp := LeadFollowResponse{
+		Days:          days,
+		FollowWindowS: followWindowS,
+		Directions:    []FollowStat{},
+	}
+	if !ok {
+		a.writeJSON(w, http.StatusOK, resp)
+		return
+	}
+
+	since := time.Now().AddDate(0, 0, -days)
+	fixesA, err := a.db.GetPositionsForPresence(catA.ID, since)
+	if err != nil {
+		a.logger.Error("Failed to get presence fixes", "tracker_id", catA.ID, "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Failed to retrieve positions")
+		return
+	}
+	fixesB, err := a.db.GetPositionsForPresence(catB.ID, since)
+	if err != nil {
+		a.logger.Error("Failed to get presence fixes", "tracker_id", catB.ID, "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Failed to retrieve positions")
+		return
+	}
+	intA := derivePresenceIntervals(fixesA)
+	intB := derivePresenceIntervals(fixesB)
+
+	depAB, folAB := followStats(intA, intB)
+	depBA, folBA := followStats(intB, intA)
+	share := func(followed, departures int) float64 {
+		if departures == 0 {
+			return 0
+		}
+		return float64(followed) / float64(departures)
+	}
+	resp.Directions = []FollowStat{
+		{LeaderID: catA.ID, Leader: catA.Name, FollowerID: catB.ID, Follower: catB.Name,
+			Departures: depAB, Followed: folAB, Share: share(folAB, depAB)},
+		{LeaderID: catB.ID, Leader: catB.Name, FollowerID: catA.ID, Follower: catA.Name,
+			Departures: depBA, Followed: folBA, Share: share(folBA, depBA)},
+	}
 	a.writeJSON(w, http.StatusOK, resp)
 }
 
