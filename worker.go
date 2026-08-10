@@ -107,6 +107,10 @@ func (w *SyncWorker) SyncAll(ctx context.Context) error {
 		w.logger.Info("Synced tracker", "tracker_id", tracker.ID, "name", tracker.Name, "positions", positions)
 	}
 
+	// Evaluate trapped / out-of-territory alerts against the fresh data
+	// (issue #7). Failures are logged inside, never fail the sync.
+	w.evaluateAlerts()
+
 	duration := time.Since(startTime)
 
 	// Log overall sync
@@ -177,6 +181,11 @@ func (w *SyncWorker) SyncTracker(ctx context.Context, trackerID int) error {
 
 	if err != nil {
 		return err
+	}
+
+	// Evaluate alerts for this tracker against the fresh data (issue #7).
+	if err := w.db.evaluateTrackerAlerts(trackerID, w.logger); err != nil {
+		w.logger.Error("Alert evaluation failed", "tracker_id", trackerID, "error", err)
 	}
 
 	w.logger.Info("Sync completed", "tracker_id", trackerID, "positions", positions, "duration", duration)

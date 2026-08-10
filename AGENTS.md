@@ -70,6 +70,7 @@ Core sync logic that:
 - Splits large date ranges into 24-hour chunks (API limitation)
 - Stores positions idempotently in SQLite
 - Updates `last_sync_timestamp` after each successful chunk for resumability
+- Evaluates trapped / out-of-territory alerts after each successful sync (issue #7, see alerts.go); evaluation failures are logged, never fail the sync
 
 Key methods:
 - `SyncAll(ctx)` - Sync all trackers incrementally from last sync time
@@ -85,6 +86,7 @@ SQLite operations using modernc.org/sqlite driver. Five tables:
 - `sync_log` - Sync operation history
 - `waypoints` - Dwell-point waypoint identity + user-assigned names (issue #2); clustering itself is recomputed on demand, this table only makes names stick
 - `behavior_models` - Fitted HMM parameters per tracker as a JSON blob (issue #5); refit on demand when stale so request-time decoding never refits
+- `alerts` - Alert event log (issue #7); one row per raised alert, `cleared_at IS NULL` marks the (single, per tracker+kind) active alert. Evaluation after each sync reconciles conditions against this table, so alert state survives restarts and the table doubles as the alert history
 
 Key methods:
 - `GetLatestPositions()` - Returns most recent position per tracker (used by status page)
@@ -134,6 +136,13 @@ Inter-cat proximity — together-episodes, patrol shifts, lead/follow (issue #6)
 - `computeShiftGrid()` buckets both cats' presence intervals (reused from presence.go) into day × hour cells (neither / a / both / b / nodata); a cat is "out" for an hour when its away coverage beats its home coverage, and hours where either cat lacks zone data are nodata, never fabricated
 - Lead/follow statistic: the departure-follow fraction — of the leader's excursions (away intervals) where the follower was verifiably home at departure time, the share where the follower left the home zone within `followWindowS` (10 min); excursions where the follower was already out or unknown are ineligible. Chosen over movement-vector cross-correlation: it needs no aligned movement data and matches the question owners ask
 
+### alerts.go
+Trapped-cat / out-of-territory alerting (issue #7) — a transparent heuristic over the other analytics' outputs, no ML:
+- Evaluation runs after each successful sync (`SyncWorker.SyncAll` evaluates all trackers, `SyncTracker` the one) and reconciles the `alerts` table: raise when a condition fires and no active alert exists, refresh the locate position while firing, set `cleared_at` when it stops. Active state always comes from the DB, so restarts and repeated evaluations stay idempotent. When the newest fix is older than `trappedStaleFix` (1h) the data is too stale to judge and alert state is left untouched
+- "Possibly trapped": over the trailing `trappedWindow` (3.5h), gated FixGPS fixes must span (almost) the whole window, number ≥ `trappedMinFixes` (5), and lie within `trappedStationaryFactor` (2) × their median accuracy radius of the centroid; the latest zone-known fix must not be home; and the spot must not be a known dwell waypoint — dwell episodes are recomputed from history ending at the start of the current stationary run (`stationaryRunStart` walks back with dwell.go's continuity rule), so the ongoing stay can never define its own waypoint and suppress the alert
+- "Out of territory": the 95% home-range contour (kde.go `computeRange`) over the trailing 30 days ending `territoryRefLag` (1h) before now — the lag keeps candidate fixes out of their own reference polygon; alert when the last `territoryConsecutiveFixes` (3) gated fixes are all > `territoryMinOutsideM` (100 m) outside it (pure-Go point-in-polygon + distance-to-ring). No contour (too little training data) → no alert
+- Phone-push delivery (ntfy/webhook) is deliberately NOT implemented — follow-up per the issue
+
 ### scheduler.go
 Cron-based scheduling using github.com/robfig/cron/v3. Runs sync jobs on configured schedule with graceful shutdown support.
 
@@ -162,12 +171,13 @@ HTTP API server providing:
 - `GET /api/proximity?date=YYYY-MM-DD` (or `from`/`to` RFC3339, max 48h; default today) - inter-cat distance series `[{t, distance_m}]` on the shared 60s grid plus together-episodes `[{start, end, duration_s, points_a, points_b}]` with both cats' paired track segments
 - `GET /api/proximity/shifts?days=7` - patrol-shift grid: per-day 24 hourly cells (`neither`/`a`/`both`/`b`/`nodata`) of which cat was out, from presence intervals
 - `GET /api/proximity/leadfollow?days=30` - both directions of the departure-follow statistic `{leader, follower, departures, followed, share}` with `follow_window_s`
+- `GET /api/alerts?days=30` - alert event log (issue #7), newest first: `{id, tracker_id, name, kind, started_at, cleared_at, duration_s, outcome (active|self_resolved), lat, lon, radius, details}`
 - `POST /api/sync` - Manual upstream resync
 - `GET /api/events` - SSE stream notifying browsers when fresh data lands
 - `GET /health` - Health check endpoint
 - Static file serving from `./web` directory
 
-The `/api/status` endpoint integrates with SureHub (github.com/perbu/go-sure) to fetch pet inside/outside status. Results are cached for 5 minutes to avoid excessive API calls. It also adds a per-tracker `presence: {state, since}` chip (issue #4) derived from WiFi-zone data alone — the flap status stays display-only (see presence.go).
+The `/api/status` endpoint integrates with SureHub (github.com/perbu/go-sure) to fetch pet inside/outside status. Results are cached for 5 minutes to avoid excessive API calls. It also adds a per-tracker `presence: {state, since}` chip (issue #4) derived from WiFi-zone data alone — the flap status stays display-only (see presence.go) — and an `alerts` array of active trapped/out-of-territory alerts (issue #7: `{id, tracker_id, name, kind, since, lat, lon, radius}`) for the status-page banner.
 
 ### web/index.html + web/app.js
 Leaflet map view: per-cat heatmaps, recent-movement trails, activity cat cards,
@@ -201,6 +211,12 @@ Radar-style status page showing:
 - WiFi-zone presence chip per cat ("home" / "out for 2h 14m")
 - Inside/outside status from SureHub pet flaps
 - Configurable POIs as markers
+- Alert banner (issue #7): one line per active alert (cat, condition,
+  duration) with a "locate" button that recenters the radar on the alert's
+  last fix at a tighter range with an accuracy circle (`radius`), plus a
+  "reset view" button; the banner clears automatically when the alert does
+- Alert history panel: the last 30 days of alerts from `/api/alerts` with
+  outcome (ongoing / self-resolved) and duration, for threshold tuning
 - Auto-refreshes every 30 seconds
 
 ## Key Design Patterns

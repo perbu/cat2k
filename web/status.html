@@ -246,6 +246,68 @@
 		.presence-chip.home { background: rgba(0, 200, 150, 0.15); color: #00c896; }
 		.presence-chip.away { background: rgba(255, 107, 107, 0.15); color: #ff6b6b; }
 
+		.alert-banner {
+			position: fixed;
+			top: 0;
+			left: 0;
+			right: 0;
+			z-index: 100;
+			background: rgba(120, 20, 20, 0.85);
+			border-bottom: 1px solid rgba(255, 107, 107, 0.6);
+			padding: 10px 16px;
+			display: flex;
+			flex-direction: column;
+			gap: 8px;
+			align-items: center;
+		}
+
+		.alert-item {
+			display: flex;
+			align-items: center;
+			gap: 12px;
+			color: #ffb3b3;
+			font-size: 0.9rem;
+		}
+
+		.alert-button {
+			background: rgba(255, 107, 107, 0.2);
+			color: #ffb3b3;
+			border: 1px solid rgba(255, 107, 107, 0.5);
+			border-radius: 999px;
+			padding: 3px 14px;
+			font-size: 0.75rem;
+			cursor: pointer;
+		}
+
+		.alert-button:hover { background: rgba(255, 107, 107, 0.35); }
+
+		.alerts-history {
+			margin-top: 24px;
+			width: min(80vw, 500px);
+			background: rgba(255, 255, 255, 0.03);
+			border: 1px solid rgba(255, 255, 255, 0.05);
+			border-radius: 12px;
+			padding: 15px 20px;
+		}
+
+		.alerts-history h2 {
+			font-size: 0.85rem;
+			font-weight: 500;
+			color: #888;
+			margin-bottom: 10px;
+			letter-spacing: 0.05em;
+			text-transform: uppercase;
+		}
+
+		.alert-history-item {
+			font-size: 0.78rem;
+			color: #aaa;
+			padding: 6px 0;
+			border-top: 1px solid rgba(255, 255, 255, 0.04);
+		}
+
+		.alert-history-item:first-child { border-top: none; }
+
 		.poi {
 			position: absolute;
 			transform: translate(-50%, -50%);
@@ -291,6 +353,8 @@
 	</style>
 </head>
 <body>
+	<div class="alert-banner" id="alert-banner" style="display:none"></div>
+
 	<div class="radar-container">
 		<div class="radar" id="radar">
 			<canvas class="heatmap-canvas" id="heatmap-canvas"></canvas>
@@ -313,9 +377,53 @@
 		<p class="no-data">Loading tracker data...</p>
 	</div>
 
+	<div class="alerts-history" id="alerts-history" style="display:none">
+		<h2>Alert history</h2>
+		<div id="alerts-history-list"></div>
+	</div>
+
 	<script>
 		const MAX_DISTANCE = 1000;
 		let homeCoords = { lat: 0, lon: 0 };
+
+		// Locate mode (issue #7): while set, the radar recenters on an alert's
+		// last fix at a tighter range instead of on home, and an accuracy
+		// circle marks the fix.
+		let viewCenter = null;    // {lat, lon} or null for the home view
+		let viewRadiusM = MAX_DISTANCE;
+		let locateRadiusM = 0;    // accuracy radius of the located fix
+
+		function radarView() {
+			return { center: viewCenter || homeCoords, radiusM: viewRadiusM };
+		}
+
+		// Project lat/lon to radar x/y (0-100 range for the SVG viewBox) using
+		// the current view (home, or the located fix in locate mode).
+		function radarProject(lat, lon) {
+			const view = radarView();
+			const distance = getDistance(view.center.lat, view.center.lon, lat, lon);
+			const bearing = getBearing(view.center.lat, view.center.lon, lat, lon);
+
+			const radarRadius = 50;
+			const normalizedDistance = Math.min(distance / view.radiusM, 1);
+			const r = normalizedDistance * radarRadius;
+			const angleRad = (bearing - 90) * Math.PI / 180;
+
+			return {
+				x: 50 + r * Math.cos(angleRad),
+				y: 50 + r * Math.sin(angleRad),
+				distance,
+				bearing
+			};
+		}
+
+		function updateRingLabels() {
+			const labels = document.querySelectorAll('.ring .ring-label');
+			labels.forEach((el, i) => {
+				const m = Math.round(viewRadiusM * (i + 1) / 4);
+				el.textContent = m >= 1000 ? (Math.round(m / 100) / 10) + 'km' : m + 'm';
+			});
+		}
 
 		function getDistance(lat1, lon1, lat2, lon2) {
 			const R = 6371000;
@@ -391,18 +499,8 @@
 
 		// Convert lat/lon to radar x/y coordinates (0-100 range for SVG viewBox)
 		function latLonToRadar(lat, lon) {
-			const distance = getDistance(homeCoords.lat, homeCoords.lon, lat, lon);
-			const bearing = getBearing(homeCoords.lat, homeCoords.lon, lat, lon);
-
-			const radarRadius = 50;
-			const normalizedDistance = Math.min(distance / MAX_DISTANCE, 1);
-			const r = normalizedDistance * radarRadius;
-			const angleRad = (bearing - 90) * Math.PI / 180;
-
-			const x = 50 + r * Math.cos(angleRad);
-			const y = 50 + r * Math.sin(angleRad);
-
-			return { x, y };
+			const p = radarProject(lat, lon);
+			return { x: p.x, y: p.y };
 		}
 
 		// Parse hex color to RGB components
@@ -471,6 +569,20 @@
 				const lines = drawTrail(tracker);
 				lines.forEach(line => svg.appendChild(line));
 			});
+
+			// In locate mode (issue #7) the located fix sits at the view
+			// center; draw its accuracy circle around it.
+			if (viewCenter && locateRadiusM > 0) {
+				const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+				circle.setAttribute('cx', 50);
+				circle.setAttribute('cy', 50);
+				circle.setAttribute('r', Math.min(locateRadiusM / viewRadiusM, 1) * 50);
+				circle.setAttribute('fill', 'rgba(255, 107, 107, 0.12)');
+				circle.setAttribute('stroke', '#ff6b6b');
+				circle.setAttribute('stroke-width', '0.4');
+				circle.setAttribute('stroke-dasharray', '1 1');
+				svg.appendChild(circle);
+			}
 		}
 
 		function createTrackerElement(tracker, index) {
@@ -501,16 +613,7 @@
 		}
 
 		function positionTracker(tracker) {
-			const distance = getDistance(homeCoords.lat, homeCoords.lon, tracker.lat, tracker.lon);
-			const bearing = getBearing(homeCoords.lat, homeCoords.lon, tracker.lat, tracker.lon);
-
-			const radarRadius = 50;
-			const normalizedDistance = Math.min(distance / MAX_DISTANCE, 1);
-			const r = normalizedDistance * radarRadius;
-			const angleRad = (bearing - 90) * Math.PI / 180;
-
-			const x = 50 + r * Math.cos(angleRad);
-			const y = 50 + r * Math.sin(angleRad);
+			const { x, y, distance, bearing } = radarProject(tracker.lat, tracker.lon);
 
 			const element = document.getElementById(`tracker-${tracker.id}`);
 			if (element) {
@@ -744,22 +847,94 @@
 		}
 
 		function positionPOI(poi) {
-			const distance = getDistance(homeCoords.lat, homeCoords.lon, poi.lat, poi.lon);
-			const bearing = getBearing(homeCoords.lat, homeCoords.lon, poi.lat, poi.lon);
-
-			const radarRadius = 50;
-			const normalizedDistance = Math.min(distance / MAX_DISTANCE, 1);
-			const r = normalizedDistance * radarRadius;
-			const angleRad = (bearing - 90) * Math.PI / 180;
-
-			const x = 50 + r * Math.cos(angleRad);
-			const y = 50 + r * Math.sin(angleRad);
+			const { x, y } = radarProject(poi.lat, poi.lon);
 
 			const id = `poi-${poi.name.replace(/\s+/g, '-').toLowerCase()}`;
 			const element = document.getElementById(id);
 			if (element) {
 				element.style.left = x + '%';
 				element.style.top = y + '%';
+			}
+		}
+
+		// "3h 12m"-style duration from a seconds count (alert history).
+		function formatDurationShort(totalSeconds) {
+			const minutes = Math.floor(totalSeconds / 60);
+			const hours = Math.floor(minutes / 60);
+			const days = Math.floor(hours / 24);
+			if (days > 0) return `${days}d ${hours % 24}h`;
+			if (hours > 0) return `${hours}h ${minutes % 60}m`;
+			return `${minutes}m`;
+		}
+
+		function alertKindLabel(kind) {
+			return kind === 'trapped' ? 'possibly trapped' : 'out of territory';
+		}
+
+		// Alert banner (issue #7): one line per active alert with a locate
+		// button that recenters the radar on the alert's last fix.
+		function renderAlertBanner(alerts) {
+			const banner = document.getElementById('alert-banner');
+			if (!alerts || alerts.length === 0) {
+				banner.style.display = 'none';
+				banner.innerHTML = '';
+				document.body.style.paddingTop = '';
+				if (viewCenter) resetRadarView();
+				return;
+			}
+
+			banner.innerHTML = alerts.map(a => `
+				<div class="alert-item">
+					<span>⚠ <strong>${a.name}</strong> ${alertKindLabel(a.kind)} — for ${formatDurationSince(a.since)}</span>
+					<button class="alert-button" onclick="locateAlert(${a.lat}, ${a.lon}, ${a.radius || 50})">locate</button>
+				</div>
+			`).join('') + (viewCenter
+				? '<button class="alert-button" onclick="resetRadarView()">reset view</button>'
+				: '');
+			banner.style.display = '';
+			document.body.style.paddingTop = banner.offsetHeight + 'px';
+		}
+
+		function locateAlert(lat, lon, radiusM) {
+			viewCenter = { lat, lon };
+			viewRadiusM = Math.max(200, radiusM * 6);
+			locateRadiusM = radiusM;
+			updateRingLabels();
+			fetchAndUpdate();
+		}
+
+		function resetRadarView() {
+			viewCenter = null;
+			viewRadiusM = MAX_DISTANCE;
+			locateRadiusM = 0;
+			updateRingLabels();
+			fetchAndUpdate();
+		}
+
+		// Alert history panel: past alerts with outcome and duration, so the
+		// heuristic thresholds can be tuned against false positives.
+		async function fetchAlertHistory() {
+			try {
+				const response = await fetch('/api/alerts?days=30');
+				const data = await response.json();
+
+				const wrap = document.getElementById('alerts-history');
+				const list = document.getElementById('alerts-history-list');
+				if (!data.alerts || data.alerts.length === 0) {
+					wrap.style.display = 'none';
+					return;
+				}
+
+				wrap.style.display = '';
+				list.innerHTML = data.alerts.map(a => {
+					const when = new Date(a.started_at).toLocaleString();
+					const outcome = a.outcome === 'active'
+						? `ongoing — ${formatDurationSince(a.started_at)}`
+						: `self-resolved after ${formatDurationShort(a.duration_s)}`;
+					return `<div class="alert-history-item"><strong>${a.name}</strong> ${alertKindLabel(a.kind)} · ${when} · ${outcome}</div>`;
+				}).join('');
+			} catch (err) {
+				console.error('Failed to fetch alert history:', err);
 			}
 		}
 
@@ -821,6 +996,10 @@
 
 				// Update trail lines
 				updateTrails(data.trackers);
+
+				// Alert banner + history (issue #7)
+				renderAlertBanner(data.alerts);
+				fetchAlertHistory();
 
 				// Handle POIs
 				if (data.pois && data.pois.length > 0) {

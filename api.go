@@ -76,6 +76,7 @@ func NewAPIServer(db *Database, cfg *Config, worker *SyncWorker, listenAddr stri
 	mux.HandleFunc("/api/proximity", api.handleGetProximity)
 	mux.HandleFunc("/api/proximity/shifts", api.handleGetShifts)
 	mux.HandleFunc("/api/proximity/leadfollow", api.handleGetLeadFollow)
+	mux.HandleFunc("/api/alerts", api.handleGetAlerts)
 	mux.HandleFunc("/api/events", api.handleEvents)
 	mux.HandleFunc("/api/sync", api.handleSync)
 	mux.HandleFunc("/health", api.handleHealth)
@@ -416,6 +417,20 @@ type StatusResponse struct {
 	Trackers    []TrackerStatus `json:"trackers"`
 	POIs        []POI           `json:"pois"`
 	HeatmapDays int             `json:"heatmap_days"`
+	Alerts      []AlertStatus   `json:"alerts"` // active trapped/out-of-territory alerts (issue #7)
+}
+
+// AlertStatus is an active alert for the /api/status banner (issue #7):
+// which cat, which condition, since when, and where to locate it.
+type AlertStatus struct {
+	ID        int64     `json:"id"`
+	TrackerID int       `json:"tracker_id"`
+	Name      string    `json:"name"`
+	Kind      string    `json:"kind"` // "trapped" or "out_of_territory"
+	Since     time.Time `json:"since"`
+	Lat       float64   `json:"lat"`
+	Lon       float64   `json:"lon"`
+	Radius    *int      `json:"radius,omitempty"` // accuracy radius of the last fix
 }
 
 // HistoryPoint represents a position in the tracker's recent history
@@ -552,6 +567,27 @@ func (a *APIServer) handleGetStatus(w http.ResponseWriter, r *http.Request) {
 		resp.POIs = a.cfg.POIs
 	} else {
 		resp.POIs = []POI{}
+	}
+
+	// Active alerts for the banner (issue #7). Raised/cleared by the alert
+	// evaluation after each sync; read-only here.
+	resp.Alerts = []AlertStatus{}
+	activeAlerts, err := a.db.GetActiveAlerts()
+	if err != nil {
+		a.logger.Error("Failed to get active alerts", "error", err)
+	} else {
+		for _, al := range activeAlerts {
+			resp.Alerts = append(resp.Alerts, AlertStatus{
+				ID:        al.ID,
+				TrackerID: al.TrackerID,
+				Name:      al.Name,
+				Kind:      al.Kind,
+				Since:     al.StartedAt,
+				Lat:       al.LastLat,
+				Lon:       al.LastLon,
+				Radius:    al.Radius,
+			})
+		}
 	}
 
 	a.writeJSON(w, http.StatusOK, resp)
@@ -1698,6 +1734,79 @@ func (a *APIServer) handleGetLeadFollow(w http.ResponseWriter, r *http.Request) 
 			Departures: depBA, Followed: folBA, Share: share(folBA, depBA)},
 	}
 	a.writeJSON(w, http.StatusOK, resp)
+}
+
+// AlertJSON is one alert event for the /api/alerts history (issue #7).
+type AlertJSON struct {
+	ID        int64      `json:"id"`
+	TrackerID int        `json:"tracker_id"`
+	Name      string     `json:"name"`
+	Kind      string     `json:"kind"`
+	StartedAt time.Time  `json:"started_at"`
+	ClearedAt *time.Time `json:"cleared_at,omitempty"`
+	DurationS float64    `json:"duration_s"` // until cleared, or until now while active
+	Outcome   string     `json:"outcome"`    // "active" or "self_resolved"
+	Lat       float64    `json:"lat"`
+	Lon       float64    `json:"lon"`
+	Radius    *int       `json:"radius,omitempty"`
+	Details   string     `json:"details,omitempty"`
+}
+
+// AlertsResponse represents the /api/alerts response.
+type AlertsResponse struct {
+	Days   int         `json:"days"`
+	Alerts []AlertJSON `json:"alerts"` // newest first
+}
+
+// handleGetAlerts handles GET /api/alerts?days=30 - the alert event log with
+// outcomes, so thresholds can be tuned against false positives. Alerts clear
+// only by the condition ending, so a cleared alert is always "self_resolved".
+func (a *APIServer) handleGetAlerts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		a.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	days := 30
+	if daysStr := r.URL.Query().Get("days"); daysStr != "" {
+		if d, err := strconv.Atoi(daysStr); err == nil && d >= 1 && d <= 365 {
+			days = d
+		}
+	}
+
+	since := time.Now().AddDate(0, 0, -days)
+	alerts, err := a.db.GetAlertHistory(since)
+	if err != nil {
+		a.logger.Error("Failed to get alert history", "error", err)
+		a.writeError(w, http.StatusInternalServerError, "Failed to retrieve alerts")
+		return
+	}
+
+	now := time.Now()
+	out := make([]AlertJSON, 0, len(alerts))
+	for _, al := range alerts {
+		entry := AlertJSON{
+			ID:        al.ID,
+			TrackerID: al.TrackerID,
+			Name:      al.Name,
+			Kind:      al.Kind,
+			StartedAt: al.StartedAt,
+			ClearedAt: al.ClearedAt,
+			Outcome:   "active",
+			DurationS: now.Sub(al.StartedAt).Seconds(),
+			Lat:       al.LastLat,
+			Lon:       al.LastLon,
+			Radius:    al.Radius,
+			Details:   al.Details,
+		}
+		if al.ClearedAt != nil {
+			entry.Outcome = "self_resolved"
+			entry.DurationS = al.ClearedAt.Sub(al.StartedAt).Seconds()
+		}
+		out = append(out, entry)
+	}
+
+	a.writeJSON(w, http.StatusOK, AlertsResponse{Days: days, Alerts: out})
 }
 
 // HeatmapBin represents a single bin in the heatmap grid

@@ -176,6 +176,27 @@ CREATE TABLE IF NOT EXISTS behavior_models (
   params TEXT NOT NULL,
   FOREIGN KEY (tracker_id) REFERENCES trackers(id)
 );
+
+-- Alert event log (issue #7). One row per raised alert; cleared_at IS NULL
+-- marks the (single, per tracker+kind) active alert. Evaluation after each
+-- sync reconciles conditions against this table, so alert state survives
+-- restarts and the table doubles as the alert history.
+CREATE TABLE IF NOT EXISTS alerts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tracker_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  started_at DATETIME NOT NULL,
+  cleared_at DATETIME,
+  last_lat REAL NOT NULL,
+  last_lon REAL NOT NULL,
+  radius INTEGER,
+  details TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (tracker_id) REFERENCES trackers(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_alerts_active
+  ON alerts(tracker_id, kind, cleared_at);
 `
 
 // ensureDatabaseDir checks that the database file's directory exists, creating
