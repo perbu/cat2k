@@ -1005,8 +1005,14 @@ function drawOverlapChart() {
 
 // ----- Presence: WiFi-zone at-home timeline + excursion stats (issue #4) -----
 
-const PRESENCE_DAYS = 7;
-const EXCURSION_DAYS = 30;
+// Right-rail cards follow the global date range (currentDays()), clamped
+// where the visualization stacks one row/column per day.
+const PRESENCE_MAX_DAYS = 14; // one 24h ribbon per day
+const BUDGET_MAX_DAYS = 31;   // one stacked budget column per day
+const SHIFT_MAX_DAYS = 14;    // one patrol-grid row per day
+function presenceDays() { return Math.min(currentDays(), PRESENCE_MAX_DAYS); }
+function budgetDays() { return Math.min(currentDays(), BUDGET_MAX_DAYS); }
+function shiftDays() { return Math.min(currentDays(), SHIFT_MAX_DAYS); }
 
 // Semantic state colors. Ribbons are zone-only (home/away) — the WiFi zone is
 // the single source of truth; the SureHub flap state is known-stale and never
@@ -1034,12 +1040,15 @@ function excBucketLabel(edgeS) {
 async function loadPresence() {
     if (allTrackers.length === 0) return;
 
+    setText('presence-sub', `WiFi-zone presence, last ${presenceDays()} days`);
+    setText('excursions-sub', `Trips off the property, last ${currentDays()} days`);
+
     await Promise.all(allTrackers.map(async t => {
         try {
             const [pRes, eRes] = await Promise.all([
-                fetch(`${API_BASE}/api/presence?tracker_id=${t.id}&days=${PRESENCE_DAYS}`)
+                fetch(`${API_BASE}/api/presence?tracker_id=${t.id}&days=${presenceDays()}`)
                     .then(r => r.ok ? r.json() : null),
-                fetch(`${API_BASE}/api/presence/excursions?tracker_id=${t.id}&days=${EXCURSION_DAYS}`)
+                fetch(`${API_BASE}/api/presence/excursions?tracker_id=${t.id}&days=${currentDays()}`)
                     .then(r => r.ok ? r.json() : null)
             ]);
             presenceByTracker[t.id] = pRes;
@@ -1166,8 +1175,6 @@ function renderExcursionStats() {
 // bottom, transit on top.
 const BEHAVIOR_STATES = ['rest', 'forage', 'transit'];
 const BEHAVIOR_STATE_COLORS = { rest: '#3B82F6', forage: '#F59E0B', transit: '#EF4444' };
-const BUDGET_DAYS = 7;
-const BEHAVIOR_MATRIX_DAYS = 30;
 
 // Fetch decoded segments (current date range), the daily budget, and the
 // hour matrix for every tracker, then re-render the layer and both panels.
@@ -1183,9 +1190,9 @@ async function loadBehavior() {
             const [segRes, budRes, matRes] = await Promise.all([
                 fetch(`${API_BASE}/api/behavior/segments?tracker_id=${t.id}&${win}`)
                     .then(r => r.ok ? r.json() : null),
-                fetch(`${API_BASE}/api/behavior/budget?tracker_id=${t.id}&days=${BUDGET_DAYS}`)
+                fetch(`${API_BASE}/api/behavior/budget?tracker_id=${t.id}&days=${budgetDays()}`)
                     .then(r => r.ok ? r.json() : null),
-                fetch(`${API_BASE}/api/behavior/matrix?tracker_id=${t.id}&days=${BEHAVIOR_MATRIX_DAYS}`)
+                fetch(`${API_BASE}/api/behavior/matrix?tracker_id=${t.id}&days=${currentDays()}`)
                     .then(r => r.ok ? r.json() : null)
             ]);
             behaviorSegByTracker[t.id] = segRes;
@@ -1260,9 +1267,17 @@ function renderBehaviorBudget() {
             return `<div class="bh-col" title="${title}">${segs}</div>`;
         }).join('');
 
+        // Weekday per column for short windows; past ~10 columns the labels
+        // would collide, so thin to a stride and switch to short dates.
+        const n = days.length;
+        const stride = n <= 10 ? 1 : Math.ceil(n / 8);
         const labels = days.map((d, i) => {
-            const isToday = i === days.length - 1;
-            return `<span class="${isToday ? 'today' : ''}">${isToday ? 'Today' : dayLabel(d.date)}</span>`;
+            const isToday = i === n - 1;
+            if (isToday) return '<span class="today">Today</span>';
+            if (i % stride !== 0) return '<span></span>';
+            const text = n <= 10 ? dayLabel(d.date) : new Date(d.date + 'T00:00:00')
+                .toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
+            return `<span>${text}</span>`;
         }).join('');
 
         return `<div class="bh-cat">
@@ -1276,13 +1291,13 @@ function renderBehaviorBudget() {
     }).filter(Boolean).join('');
 
     container.innerHTML = sections
-        ? `<div class="bh-sub">Activity budget · ${BUDGET_DAYS}d</div>${sections}`
+        ? `<div class="bh-sub">Activity budget · ${budgetDays()}d</div>${sections}`
         : '<div class="panel-empty">No behavior model yet — needs more GPS history.</div>';
 }
 
 // "State by hour" panel: per cat, 24 stacked micro-bars (one per hour of
-// day) showing the state share within that hour over the last 30 days — the
-// crepuscular rhythm view.
+// day) showing the state share within that hour over the current date
+// range — the crepuscular rhythm view.
 function renderBehaviorMatrix() {
     const container = document.getElementById('behavior-matrix');
     if (!container) return;
@@ -1316,14 +1331,11 @@ function renderBehaviorMatrix() {
     }).filter(Boolean).join('');
 
     container.innerHTML = sections
-        ? `<div class="bh-sub">State by hour · ${BEHAVIOR_MATRIX_DAYS}d</div>${sections}`
+        ? `<div class="bh-sub">State by hour · ${currentDays()}d</div>${sections}`
         : '';
 }
 
 // ----- Inter-cat proximity: distance series, together episodes, shifts, lead/follow (issue #6) -----
-
-const PROXIMITY_SHIFT_DAYS = 7;
-const PROXIMITY_LEADFOLLOW_DAYS = 30;
 
 // Local YYYY-MM-DD for the date input (toISOString would give UTC).
 function localDateStr(d) {
@@ -1335,13 +1347,15 @@ function localDateStr(d) {
 // re-render the chart, map overlay, and panels. Swallows errors; stale
 // panels stay as they are.
 async function loadProximity() {
+    setText('shifts-sub', `Who was out, hour by hour · ${shiftDays()}d`);
+    setText('leadfollow-sub', `Does one cat trail the other out? · ${currentDays()}d`);
     if (allTrackers.length < 2) return;
     const date = proximitySettings.date || localDateStr(new Date());
     try {
         const [pRes, sRes, lRes] = await Promise.all([
             fetch(`${API_BASE}/api/proximity?date=${date}`).then(r => r.ok ? r.json() : null),
-            fetch(`${API_BASE}/api/proximity/shifts?days=${PROXIMITY_SHIFT_DAYS}`).then(r => r.ok ? r.json() : null),
-            fetch(`${API_BASE}/api/proximity/leadfollow?days=${PROXIMITY_LEADFOLLOW_DAYS}`).then(r => r.ok ? r.json() : null)
+            fetch(`${API_BASE}/api/proximity/shifts?days=${shiftDays()}`).then(r => r.ok ? r.json() : null),
+            fetch(`${API_BASE}/api/proximity/leadfollow?days=${currentDays()}`).then(r => r.ok ? r.json() : null)
         ]);
         proximityData = pRes;
         shiftData = sRes;
@@ -1681,6 +1695,8 @@ async function loadAllTrackerData() {
         updateMeta();
         loadWaypoints();
         loadBehavior();
+        loadPresence();
+        loadProximity();
 
         setLoading(false);
         applyAutoUIState();
@@ -1943,8 +1959,6 @@ async function init() {
         loadActivity();
         loadPOIs();
         loadOverlap();
-        loadPresence();
-        loadProximity();
 
         await loadAllTrackerData();
         loadRanges();
