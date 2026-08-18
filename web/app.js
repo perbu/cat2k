@@ -178,6 +178,32 @@ function makePinIcon(color) {
     });
 }
 
+// Initial bearing (degrees clockwise from north) from point 1 to point 2.
+function bearingBetween(lat1, lon1, lat2, lon2) {
+    const toRad = d => d * Math.PI / 180;
+    const y = Math.sin(toRad(lon2 - lon1)) * Math.cos(toRad(lat2));
+    const x = Math.cos(toRad(lat1)) * Math.sin(toRad(lat2))
+        - Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(toRad(lon2 - lon1));
+    return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+}
+
+// Hourly trail marker: a small arrow rotated to the direction of travel.
+// The SVG points north; CSS rotation is clockwise like the bearing, so the
+// arrow aligns with the map. Distinct shape from the waypoint circles.
+function makeHourArrowIcon(color, bearing) {
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 18 18"
+        style="display:block;transform:rotate(${Math.round(bearing)}deg)">
+        <path d="M9 1.5 L14.5 16 L9 12.5 L3.5 16 Z"
+              fill="${color}" stroke="#fff" stroke-width="1.2"/>
+    </svg>`;
+    return L.divIcon({
+        html: svg,
+        className: 'hour-arrow-icon',
+        iconSize: [18, 18],
+        iconAnchor: [9, 9]
+    });
+}
+
 // Initialize date inputs with defaults
 function initializeDateInputs() {
     const end = new Date();
@@ -571,8 +597,9 @@ function calculateCenter(positions) {
 }
 
 // Draw the recent-movement trail per tracker: consecutive fixes since 06:00
-// joined as age-faded line segments, with an hourly dot at the fix nearest
-// each whole hour, layered above the heatmap.
+// joined as age-faded line segments, with an hourly arrow at the fix nearest
+// each whole hour pointing in the direction of travel, layered above the
+// heatmap.
 // Reuses the positions already in positionsByTracker — no extra API call.
 function renderTrails() {
     Object.values(trailLayers).forEach(group => map.removeLayer(group));
@@ -608,9 +635,12 @@ function renderTrails() {
             L.polyline(splineSegment(pts, i), trailSegmentStyle(base, midTime)).addTo(group);
         }
 
-        // Hourly dots at the fix nearest each whole hour (within tolerance).
-        // Dots piling up on one spot = the cat stayed there. They mark real
-        // fixes, not spline-interpolated points.
+        // Hourly arrows at the fix nearest each whole hour (within
+        // tolerance), rotated to the direction of travel through that fix
+        // (previous fix -> next fix, so the heading isn't jitter from the
+        // marked fix alone). Arrows piling up on one spot with scattered
+        // headings = the cat stayed there. They mark real fixes, not
+        // spline-interpolated points.
         for (let t = cutoff + 3600000; t <= now; t += 3600000) {
             let best = null;
             let bestDelta = Infinity;
@@ -620,13 +650,14 @@ function renderTrails() {
             });
             if (!best || bestDelta > HOUR_DOT_TOLERANCE_MIN * 60000) continue;
 
-            L.circleMarker([best.lat, best.lng], {
-                radius: 4.5,
-                color: '#fff',
-                weight: 1.5,
-                fillColor: base,
-                fillOpacity: 0.95
-            }).addTo(group).bindTooltip(new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+            const idx = recent.indexOf(best);
+            const prev = recent[idx - 1], next = recent[idx + 1];
+            const from = prev || best, to = next || best;
+            const bearing = bearingBetween(from.lat, from.lng, to.lat, to.lng);
+
+            L.marker([best.lat, best.lng], { icon: makeHourArrowIcon(base, bearing) })
+                .addTo(group)
+                .bindTooltip(new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
         }
 
         group.addTo(map);
@@ -850,10 +881,17 @@ function ringsToLatLngs(rings) {
     return (rings || []).map(ring => ring.map(([lon, lat]) => [lat, lon]));
 }
 
-// Draw one tracker's contour pair: 95% home range as a thin outline with a
-// faint fill, 50% core as a stronger fill in the cat's accent color. With two
-// cats enabled the translucent home fills blend where they overlap, which
-// reads as the shared territory — no polygon clipping needed.
+// Draw one tracker's contour pair: 95% home range as a thin dotted outline
+// with a faint fill, 50% core as a stronger fill in the cat's accent color.
+// The outlines are dotted so they don't read as movement tracks (issue:
+// solid rings collided visually with the trail polylines). With two cats
+// enabled the translucent home fills blend where they overlap, which reads
+// as the shared territory — no polygon clipping needed.
+// The group must be a FeatureGroup, not a LayerGroup: only FeatureGroup
+// propagates child mouse events, and Layer.openTooltip overwrites the
+// tooltip source with the group itself for plain LayerGroups, which lack
+// getCenter/getLatLng/getBounds — Leaflet then throws "Unable to get
+// source layer LatLng" whenever a contour polygon receives focus.
 function renderRangeLayer(id) {
     if (rangeLayers[id]) { map.removeLayer(rangeLayers[id]); delete rangeLayers[id]; }
     if (!map || !rangeSettings.enabled || rangeSettings.cats[id] === false) return;
@@ -862,18 +900,20 @@ function renderRangeLayer(id) {
     if (!data) return;
     const accent = accentForIndex(trackerPaletteIndex(id)).color;
 
-    const group = L.layerGroup();
+    const group = L.featureGroup();
     const home = ringsToLatLngs(data.home);
     const core = ringsToLatLngs(data.core);
     home.forEach(latlngs => {
         L.polygon(latlngs, {
             color: accent, weight: 2, opacity: 0.9,
+            dashArray: '1 7', lineCap: 'round',
             fillColor: accent, fillOpacity: 0.07
         }).addTo(group);
     });
     core.forEach(latlngs => {
         L.polygon(latlngs, {
-            color: accent, weight: 1, opacity: 0.8,
+            color: accent, weight: 2, opacity: 0.8,
+            dashArray: '1 5', lineCap: 'round',
             fillColor: accent, fillOpacity: 0.35
         }).addTo(group);
     });
