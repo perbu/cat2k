@@ -530,6 +530,14 @@ func (a *APIServer) handleGetStatus(w http.ResponseWriter, r *http.Request) {
 			Power:     newPowerStatus(p.State, time.Now()),
 		}
 
+		// Battery is device state, so the polled reading wins over the one
+		// frozen into the newest stored fix — while a collar sits on the
+		// charger Weenect leaves that fix's charge behind at, say, 53% while
+		// the device itself is back at 100% (power.go).
+		if tracker.Power != nil && tracker.Power.Battery != nil {
+			tracker.Battery = tracker.Power.Battery
+		}
+
 		// Fetch recent position history for trail
 		recentPositions, err := a.db.GetRecentPositions(p.TrackerID, historyStart)
 		if err != nil {

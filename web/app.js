@@ -388,6 +388,10 @@ const POWER_STATES = {
     live:     { quiet: false },
     off:      { quiet: true,  pill: 'off',       lead: 'Switched off' },
     offline:  { quiet: true,  pill: 'no signal', lead: 'Out of contact' },
+    // Reachable but producing nothing — typically the collar off the cat and
+    // on a charger. Distinct from 'no signal', which claims it is unreachable,
+    // so the lead says Weenect still sees it and the pill says what is missing.
+    stale:    { quiet: true,  pill: 'no fix',    lead: 'Online' },
     sleeping: { quiet: true,  pill: 'asleep',    lead: 'In deep sleep' },
     expired:  { quiet: true,  pill: 'no sub',    lead: 'Subscription expired', warn: true },
     unknown:  { quiet: false }
@@ -414,13 +418,16 @@ function powerPresentation(power) {
 
 // Battery pill markup: a shell whose inner fill width is the charge %, followed
 // by the percentage in mono. Turns amber below 20% (DESIGN.md battery rule).
-function batteryPill(pct) {
+// `fromFix` marks a reading taken from the newest stored position rather than
+// polled from the device, which the card dims — see renderCatCards.
+function batteryPill(pct, fromFix = false) {
     if (pct === null || pct === undefined) {
         return '<span class="battery"><span class="batt-pct mono">—</span></span>';
     }
     const clamped = Math.max(0, Math.min(100, pct));
     const low = clamped < 20 ? ' low' : '';
-    return `<span class="battery${low}">
+    const src = fromFix ? ' from-fix' : '';
+    return `<span class="battery${low}${src}">
         <span class="batt-shell"><span class="batt-fill" style="width:${clamped}%"></span></span>
         <span class="batt-pct mono">${clamped}%</span>
     </span>`;
@@ -463,8 +470,6 @@ function renderCatCards() {
         // Status from the latest stored position (newest-first list).
         const positions = positionsByTracker[tracker.id] || [];
         const latest = positions[0];
-        const battery = latest ? batteryPill(latest.battery) : batteryPill(null);
-
         // Whether the collar is on comes from Weenect's own device state, not
         // from the age of our newest fix — the collars come off most evenings,
         // and that looks identical to a lost signal from the position stream
@@ -474,6 +479,14 @@ function renderCatCards() {
         const state = powerPresentation(power);
         const fixAt = power?.last_fix_at ? new Date(power.last_fix_at)
             : (latest ? new Date(latest.timestamp) : null);
+
+        // Battery is device state too. The newest stored fix keeps whatever
+        // charge the collar had when it last reported, so a collar charging on
+        // the shelf reads 53% there while the device is really back at 100%;
+        // prefer the polled reading and dim the stored one when it stands in.
+        const battery = power?.battery !== undefined && power?.battery !== null
+            ? batteryPill(power.battery)
+            : batteryPill(latest ? latest.battery : null, true);
 
         let lastSeen = 'No recent fixes';
         if (state.lead) {

@@ -635,9 +635,12 @@
             color: var(--batt-low);
         }
 
-        /* Battery and activity are last-known, not current, once the collar
-           stops reporting — dim them rather than drop them. */
-        .cat-card.quiet .battery,
+        /* Activity is last-known, not current, once the collar stops
+           reporting — dim it rather than drop it. Battery is dimmed only when
+           it fell back to the newest stored fix (.from-fix); a polled device
+           reading stays bright, because it is current even while the collar
+           is producing no fixes. */
+        .cat-card.quiet .battery.from-fix,
         .cat-card.quiet .cat-bars {
             opacity: 0.45;
         }

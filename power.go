@@ -23,6 +23,11 @@ const (
 	// PowerOffline means unreachable with no cause given — out of GSM
 	// coverage, or switched off so abruptly the alarm never got out.
 	PowerOffline DevicePower = "offline"
+	// PowerStale means Weenect still calls the tracker online, but it has not
+	// reported a fix of its own for powerStaleAfter. That is the collar
+	// sitting on a charger indoors: reachable, and producing nothing. Kept
+	// distinct from PowerOffline, which claims the device is unreachable.
+	PowerStale DevicePower = "stale"
 	// PowerSleeping means deep sleep, so reporting is suspended by design.
 	PowerSleeping DevicePower = "sleeping"
 	// PowerExpired means the subscription has lapsed. The collar may well be
@@ -33,12 +38,15 @@ const (
 	PowerUnknown DevicePower = "unknown"
 )
 
-// powerStaleAfter is how old the newest upstream fix may get before a
-// nominally-live collar is reported as stale instead. The collars run a 1
-// minute reporting interval with a 5 minute keep-alive, so a quarter hour of
-// silence from a tracker Weenect still calls online means one of the two is
-// wrong — and saying so beats presenting the last fix as current.
-const powerStaleAfter = 15 * time.Minute
+// powerStaleAfter is how long a nominally-live collar may go without a report
+// of its own before it is reported PowerStale instead.
+//
+// Measured against the observed gap distribution between consecutive
+// date_tracker values while a collar is active: median 1 min, p95 ~6 min,
+// p99 ~21 min. Thirty minutes sits clear of normal jitter, so the state does
+// not flicker on an ordinary quiet patch, while still catching a collar that
+// has actually stopped reporting.
+const powerStaleAfter = 30 * time.Minute
 
 // TrackerState is a collar's reporting state as of the last poll of Weenect's
 // tracker endpoint. It is stored per tracker so the state survives restarts
@@ -51,25 +59,32 @@ type TrackerState struct {
 	// tracker, so it belongs in the same indicator.
 	SubscriptionActive bool
 	RemainingDays      int
-	// LastFixAt is the timestamp of the newest fix Weenect holds, which is
-	// when the collar last reported — the honest "since" for any state other
-	// than live. Zero when unknown.
+	// Battery is the collar's charge as of this poll. It has to come from
+	// here rather than from the newest stored position: while a collar sits
+	// on the charger Weenect mutates its last position record in place (same
+	// id, type flipped to CMD-X, date_server advanced to now) and raises the
+	// battery to the live reading, so the stored row keeps the charge the
+	// collar had when it last actually fixed — 53% on a collar the app
+	// correctly shows at 100%. Nil when not polled.
+	Battery      *int
+	BatteryState string
+	// LastFixAt is when the collar itself last reported. Zero when unknown.
 	LastFixAt time.Time
 	// CheckedAt is when this state was polled. Zero means never.
 	CheckedAt time.Time
 }
 
 // Reported returns the state with staleness overlaid, given the current time.
-// Stored state is kept exactly as Weenect reported it; a live collar whose
-// newest fix has gone quiet for powerStaleAfter is downgraded to
-// PowerOffline here, at response time, since staleness depends on now and not
-// on when the poll happened. An unpolled state is left alone.
+// Stored state is kept exactly as Weenect reported it; a live collar that has
+// not reported for powerStaleAfter becomes PowerStale here, at response time,
+// since staleness depends on now and not on when the poll happened. An
+// unpolled state is left alone.
 func (s TrackerState) Reported(now time.Time) TrackerState {
 	if s.Power != PowerLive || s.LastFixAt.IsZero() {
 		return s
 	}
 	if now.Sub(s.LastFixAt) > powerStaleAfter {
-		s.Power = PowerOffline
+		s.Power = PowerStale
 	}
 	return s
 }
@@ -81,6 +96,10 @@ func (s TrackerState) Reported(now time.Time) TrackerState {
 type PowerStatus struct {
 	State     DevicePower `json:"state"`
 	OffReason *string     `json:"off_reason,omitempty"`
+	// Battery is the collar's charge as of the poll — the live reading the
+	// Weenect app shows, not the charge frozen into the newest stored fix.
+	Battery      *int   `json:"battery,omitempty"`
+	BatteryState string `json:"battery_state,omitempty"`
 	// LastFixAt is when the collar last reported to Weenect — the "since" for
 	// any state other than live.
 	LastFixAt *time.Time `json:"last_fix_at,omitempty"`
@@ -108,6 +127,8 @@ func newPowerStatus(s TrackerState, now time.Time) *PowerStatus {
 	p := &PowerStatus{
 		State:              s.Power,
 		OffReason:          s.OffReason,
+		Battery:            s.Battery,
+		BatteryState:       s.BatteryState,
 		CheckedAt:          &checked,
 		SubscriptionActive: s.SubscriptionActive,
 		RemainingDays:      &days,
@@ -142,6 +163,8 @@ type weenectStatePosition struct {
 	IsOnline      bool    `json:"is_online"`
 	OffReason     *string `json:"off_reason"`
 	IsInDeepSleep bool    `json:"is_in_deep_sleep"`
+	Battery       int     `json:"battery"`
+	BatteryState  string  `json:"battery_state"`
 	// Timestamps mirror the position endpoint's; weenect.WeenectTime tolerates
 	// the nulls the API sends for last_message.
 	LastMessage weenect.WeenectTime `json:"last_message"`
@@ -149,15 +172,27 @@ type weenectStatePosition struct {
 	DateTracker weenect.WeenectTime `json:"date_tracker"`
 }
 
-// timestamp mirrors weenect.Position.GetTimestamp's preference order.
-func (p weenectStatePosition) timestamp() time.Time {
+// lastReportAt returns when the collar itself last reported.
+//
+// It deliberately does NOT follow weenect.Position.GetTimestamp's order
+// (last_message, then date_server, then date_tracker). date_server is when
+// Weenect last touched the record, and it keeps advancing to now while a
+// quiet collar is kept alive — trusting it makes a collar that has produced
+// nothing for hours look like it reported seconds ago, which defeats the
+// staleness check entirely. date_tracker is stamped by the tracker, so it
+// stops when the tracker does.
+//
+// The tracker's clock freezes while it is off, so for one record just after a
+// switch-on date_tracker can read hours old; the next real fix corrects it a
+// minute later, and until then "no fix for a while" is the truthful reading.
+func (p weenectStatePosition) lastReportAt() time.Time {
+	if !p.DateTracker.IsZero() {
+		return p.DateTracker.Time
+	}
 	if !p.LastMessage.IsZero() {
 		return p.LastMessage.Time
 	}
-	if !p.DateServer.IsZero() {
-		return p.DateServer.Time
-	}
-	return p.DateTracker.Time
+	return p.DateServer.Time
 }
 
 // state derives the stored reporting state from a polled tracker record.
@@ -176,7 +211,10 @@ func (t weenectTrackerState) state(now time.Time) TrackerState {
 		pos = &t.Position[0]
 	}
 	if pos != nil {
-		s.LastFixAt = pos.timestamp()
+		s.LastFixAt = pos.lastReportAt()
+		s.BatteryState = pos.BatteryState
+		battery := pos.Battery
+		s.Battery = &battery
 		if pos.OffReason != nil && *pos.OffReason != "" {
 			s.OffReason = pos.OffReason
 		}

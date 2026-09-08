@@ -103,6 +103,8 @@ CREATE TABLE IF NOT EXISTS trackers (
   last_sync_timestamp DATETIME,
   power TEXT,
   power_off_reason TEXT,
+  power_battery INTEGER,
+  power_battery_state TEXT,
   power_subscription_active BOOLEAN,
   power_remaining_days INTEGER,
   power_last_fix_at DATETIME,
@@ -336,6 +338,8 @@ var positionColumns = []tableColumn{
 var trackerColumns = []tableColumn{
 	{"power", "power TEXT"},
 	{"power_off_reason", "power_off_reason TEXT"},
+	{"power_battery", "power_battery INTEGER"},
+	{"power_battery_state", "power_battery_state TEXT"},
 	{"power_subscription_active", "power_subscription_active BOOLEAN"},
 	{"power_remaining_days", "power_remaining_days INTEGER"},
 	{"power_last_fix_at", "power_last_fix_at DATETIME"},
@@ -402,15 +406,18 @@ func (d *Database) UpsertTrackerState(id int, name string, s TrackerState) (Devi
 
 	query := `
 		INSERT INTO trackers (
-			id, name, power, power_off_reason, power_subscription_active,
+			id, name, power, power_off_reason, power_battery, power_battery_state,
+			power_subscription_active,
 			power_remaining_days, power_last_fix_at, power_checked_at,
 			created_at, updated_at
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
 		ON CONFLICT(id) DO UPDATE SET
 			name = excluded.name,
 			power = excluded.power,
 			power_off_reason = excluded.power_off_reason,
+			power_battery = excluded.power_battery,
+			power_battery_state = excluded.power_battery_state,
 			power_subscription_active = excluded.power_subscription_active,
 			power_remaining_days = excluded.power_remaining_days,
 			power_last_fix_at = excluded.power_last_fix_at,
@@ -418,6 +425,7 @@ func (d *Database) UpsertTrackerState(id int, name string, s TrackerState) (Devi
 			updated_at = CURRENT_TIMESTAMP
 	`
 	_, err = d.db.Exec(query, id, name, string(s.Power), s.OffReason,
+		s.Battery, nullIfEmpty(s.BatteryState),
 		s.SubscriptionActive, s.RemainingDays, lastFix, s.CheckedAt)
 	if err != nil {
 		return PowerUnknown, err
@@ -447,7 +455,7 @@ func (d *Database) GetTrackerPower(id int) (DevicePower, error) {
 // selects them. A row with no stored poll yields a zero-valued state whose
 // Power is PowerUnknown, so callers never mistake "not yet polled" for a
 // claim about the device.
-func scanTrackerState(power, offReason sql.NullString, subActive, remainingDays sql.NullInt64, lastFix, checkedAt sql.NullTime) TrackerState {
+func scanTrackerState(power, offReason, batteryState sql.NullString, battery, subActive, remainingDays sql.NullInt64, lastFix, checkedAt sql.NullTime) TrackerState {
 	s := TrackerState{Power: PowerUnknown}
 	if power.Valid && power.String != "" {
 		s.Power = DevicePower(power.String)
@@ -455,6 +463,13 @@ func scanTrackerState(power, offReason sql.NullString, subActive, remainingDays 
 	if offReason.Valid && offReason.String != "" {
 		r := offReason.String
 		s.OffReason = &r
+	}
+	if battery.Valid {
+		b := int(battery.Int64)
+		s.Battery = &b
+	}
+	if batteryState.Valid {
+		s.BatteryState = batteryState.String
 	}
 	if subActive.Valid {
 		s.SubscriptionActive = subActive.Int64 != 0
@@ -473,8 +488,18 @@ func scanTrackerState(power, offReason sql.NullString, subActive, remainingDays 
 
 // trackerStateColumns is the SELECT list scanTrackerState expects, so the
 // queries that join in tracker power state stay in step with the scanner.
-const trackerStateColumns = `t.power, t.power_off_reason, t.power_subscription_active,
+const trackerStateColumns = `t.power, t.power_off_reason, t.power_battery_state,
+			t.power_battery, t.power_subscription_active,
 			t.power_remaining_days, t.power_last_fix_at, t.power_checked_at`
+
+// nullIfEmpty stores an empty string as NULL, so an unpolled text column and
+// one polled as blank do not read differently.
+func nullIfEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
 
 // GetTracker retrieves a tracker by ID
 func (d *Database) GetTracker(id int) (*TrackerRecord, error) {
@@ -703,18 +728,18 @@ func (d *Database) GetAllTrackers() ([]TrackerWithCount, error) {
 	for rows.Next() {
 		var t TrackerWithCount
 		var lastSync sql.NullTime
-		var power, offReason sql.NullString
-		var subActive, remainingDays sql.NullInt64
+		var power, offReason, batteryState sql.NullString
+		var battery, subActive, remainingDays sql.NullInt64
 		var lastFix, checkedAt sql.NullTime
 		err := rows.Scan(&t.ID, &t.Name, &lastSync, &t.PositionCount,
-			&power, &offReason, &subActive, &remainingDays, &lastFix, &checkedAt)
+			&power, &offReason, &batteryState, &battery, &subActive, &remainingDays, &lastFix, &checkedAt)
 		if err != nil {
 			return nil, err
 		}
 		if lastSync.Valid {
 			t.LastSync = lastSync.Time
 		}
-		t.State = scanTrackerState(power, offReason, subActive, remainingDays, lastFix, checkedAt)
+		t.State = scanTrackerState(power, offReason, batteryState, battery, subActive, remainingDays, lastFix, checkedAt)
 		trackers = append(trackers, t)
 	}
 
@@ -915,15 +940,15 @@ func (d *Database) GetLatestPositions() ([]LatestPosition, error) {
 	var positions []LatestPosition
 	for rows.Next() {
 		var p LatestPosition
-		var power, offReason sql.NullString
-		var subActive, remainingDays sql.NullInt64
+		var power, offReason, batteryState sql.NullString
+		var battery, subActive, remainingDays sql.NullInt64
 		var lastFix, checkedAt sql.NullTime
 		err := rows.Scan(&p.TrackerID, &p.TrackerName, &p.Latitude, &p.Longitude, &p.Timestamp, &p.Battery,
-			&power, &offReason, &subActive, &remainingDays, &lastFix, &checkedAt)
+			&power, &offReason, &batteryState, &battery, &subActive, &remainingDays, &lastFix, &checkedAt)
 		if err != nil {
 			return nil, err
 		}
-		p.State = scanTrackerState(power, offReason, subActive, remainingDays, lastFix, checkedAt)
+		p.State = scanTrackerState(power, offReason, batteryState, battery, subActive, remainingDays, lastFix, checkedAt)
 		positions = append(positions, p)
 	}
 

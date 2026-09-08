@@ -27,6 +27,56 @@ const mytrackerItem = `{
   }]
 }`
 
+// keepAliveItem is the same tracker while its collar sits on a charger:
+// Weenect has mutated the last position record in place — type flipped to
+// CMD-X, date_server advanced to now, battery raised to the live 100% — while
+// date_tracker stays frozen at the collar's last real report.
+const keepAliveItem = `{
+  "id": 616818,
+  "name": "Bella",
+  "active": true,
+  "remaining_days": 242,
+  "position": [{
+    "battery": 100,
+    "battery_state": "GOOD",
+    "date_server": "2026-09-08T19:27:44+00:00",
+    "date_tracker": "2026-09-08T15:33:15+00:00",
+    "last_message": null,
+    "type": "CMD-X",
+    "is_online": true,
+    "is_in_deep_sleep": false,
+    "off_reason": null
+  }]
+}`
+
+// A keep-alive must not read as a fresh report. date_server advancing to now
+// is Weenect touching the record, not the collar reporting, so LastFixAt has
+// to track date_tracker or the staleness check never fires.
+func TestKeepAliveDoesNotLookFresh(t *testing.T) {
+	var item weenectTrackerState
+	if err := json.Unmarshal([]byte(keepAliveItem), &item); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	now := time.Date(2026, 9, 8, 19, 27, 46, 0, time.UTC)
+	got := item.state(now)
+
+	wantFix := time.Date(2026, 9, 8, 15, 33, 15, 0, time.UTC)
+	if !got.LastFixAt.Equal(wantFix) {
+		t.Errorf("LastFixAt = %v, want date_tracker %v", got.LastFixAt, wantFix)
+	}
+	if got.Battery == nil || *got.Battery != 100 {
+		t.Errorf("Battery = %v, want the live 100%%", got.Battery)
+	}
+	// Stored state is what Weenect said; the overlay is what we serve.
+	if got.Power != PowerLive {
+		t.Errorf("stored Power = %q, want %q", got.Power, PowerLive)
+	}
+	if s := got.Reported(now).Power; s != PowerStale {
+		t.Errorf("reported Power = %q, want %q after ~4h without a report", s, PowerStale)
+	}
+}
+
 func TestWeenectTrackerStateDecodesLivePayload(t *testing.T) {
 	var item weenectTrackerState
 	if err := json.Unmarshal([]byte(mytrackerItem), &item); err != nil {
@@ -42,10 +92,13 @@ func TestWeenectTrackerStateDecodesLivePayload(t *testing.T) {
 	if got.OffReason != nil {
 		t.Errorf("OffReason = %q, want nil", *got.OffReason)
 	}
-	// last_message is null, so the fix time falls through to date_server.
-	want := time.Date(2026, 9, 8, 15, 13, 49, 0, time.UTC)
+	// date_tracker is the collar's own clock, so it wins over date_server.
+	want := time.Date(2026, 9, 8, 15, 7, 49, 0, time.UTC)
 	if !got.LastFixAt.Equal(want) {
 		t.Errorf("LastFixAt = %v, want %v", got.LastFixAt, want)
+	}
+	if got.Battery == nil || *got.Battery != 53 {
+		t.Errorf("Battery = %v, want 53", got.Battery)
 	}
 	if !got.SubscriptionActive || got.RemainingDays != 1 {
 		t.Errorf("subscription = (%v, %d days), want (true, 1 day)", got.SubscriptionActive, got.RemainingDays)
@@ -65,14 +118,14 @@ func TestTrackerStateClassification(t *testing.T) {
 		{
 			name: "switched off names its reason",
 			in: weenectTrackerState{Active: true, Position: []weenectStatePosition{{
-				DateServer: wt(fix), OffReason: &reason,
+				DateTracker: wt(fix), OffReason: &reason,
 			}}},
 			want: PowerOff,
 		},
 		{
 			name: "offline without a reason is not called off",
 			in: weenectTrackerState{Active: true, Position: []weenectStatePosition{{
-				DateServer: wt(fix),
+				DateTracker: wt(fix),
 			}}},
 			want: PowerOffline,
 		},
@@ -81,7 +134,7 @@ func TestTrackerStateClassification(t *testing.T) {
 			// and sleeping says why.
 			name: "deep sleep wins over online",
 			in: weenectTrackerState{Active: true, Position: []weenectStatePosition{{
-				DateServer: wt(fix), IsOnline: true, IsInDeepSleep: true,
+				DateTracker: wt(fix), IsOnline: true, IsInDeepSleep: true,
 			}}},
 			want: PowerSleeping,
 		},
@@ -90,7 +143,7 @@ func TestTrackerStateClassification(t *testing.T) {
 			// so it takes precedence over whatever the last fix claimed.
 			name: "lapsed subscription outranks a live fix",
 			in: weenectTrackerState{Active: false, Position: []weenectStatePosition{{
-				DateServer: wt(fix), IsOnline: true,
+				DateTracker: wt(fix), IsOnline: true,
 			}}},
 			want: PowerExpired,
 		},
@@ -99,7 +152,7 @@ func TestTrackerStateClassification(t *testing.T) {
 			// decides expiry, or a working collar would blank out.
 			name: "zero remaining days on an active subscription stays live",
 			in: weenectTrackerState{Active: true, RemainingDays: 0, Position: []weenectStatePosition{{
-				DateServer: wt(fix), IsOnline: true,
+				DateTracker: wt(fix), IsOnline: true,
 			}}},
 			want: PowerLive,
 		},
@@ -126,8 +179,8 @@ func TestReportedDowngradesStaleLive(t *testing.T) {
 	if got := live.Reported(fix.Add(powerStaleAfter - time.Minute)).Power; got != PowerLive {
 		t.Errorf("within the stale window: Power = %q, want %q", got, PowerLive)
 	}
-	if got := live.Reported(fix.Add(powerStaleAfter + time.Minute)).Power; got != PowerOffline {
-		t.Errorf("past the stale window: Power = %q, want %q", got, PowerOffline)
+	if got := live.Reported(fix.Add(powerStaleAfter + time.Minute)).Power; got != PowerStale {
+		t.Errorf("past the stale window: Power = %q, want %q", got, PowerStale)
 	}
 
 	// A state with no fix time has nothing to age against, and one that is
