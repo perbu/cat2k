@@ -5,6 +5,7 @@
   "rate_limit": 4.0,
   "backfill_start_date": "2024-01-01",
   "sync_schedule": "*/5 * * * *",
+  "tracker_state_interval_s": 60,
   "log_level": "info",
   "http_listen": ":8080",
   "http_enabled": true,

@@ -81,6 +81,13 @@
             position: relative;
         }
 
+        /* Suppress the browser focus ring Leaflet triggers on the map
+           container and markers — it reads as a stray blue frame. */
+        .leaflet-container:focus,
+        .leaflet-marker-icon:focus {
+            outline: none;
+        }
+
         /* ---------- Header ---------- */
         .panel-header {
             display: flex;
@@ -602,6 +609,43 @@
             letter-spacing: -0.01em;
         }
 
+        /* A collar that isn't reporting keeps its identity color but goes
+           hollow, so the card never reads as live data. */
+        .cat-dot.quiet {
+            background: transparent !important;
+            box-shadow: inset 0 0 0 1.6px var(--dot-accent);
+        }
+
+        /* Reporting-state pill: chrome-colored per the one-accent rule, so a
+           cat's own color never means "off". */
+        .cat-state {
+            font-size: 9.5px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.07em;
+            padding: 2.5px 6px;
+            border-radius: 20px;
+            background: var(--seg-track);
+            color: var(--text-2);
+            white-space: nowrap;
+        }
+
+        .cat-state.warn {
+            background: rgba(224, 138, 0, 0.12);
+            color: var(--batt-low);
+        }
+
+        /* Battery and activity are last-known, not current, once the collar
+           stops reporting — dim them rather than drop them. */
+        .cat-card.quiet .battery,
+        .cat-card.quiet .cat-bars {
+            opacity: 0.45;
+        }
+
+        .cat-sub-warn {
+            color: var(--batt-low);
+        }
+
         /* Battery pill */
         .battery {
             margin-left: auto;
@@ -1109,6 +1153,15 @@
             <div class="heatmap-card">
                 <div class="heatmap-head">
                     <div>
+                        <div class="card-title">Heat map</div>
+                        <div class="card-sub">Where the cats spend their time</div>
+                    </div>
+                    <button class="toggle on" id="heatmap-toggle" role="switch" aria-checked="true" aria-label="Show heat map">
+                        <span class="knob"></span>
+                    </button>
+                </div>
+                <div class="wp-toggle-row">
+                    <div>
                         <div class="card-title">Auto-tune</div>
                         <div class="card-sub">Heat map adapts to zoom &amp; density</div>
                     </div>
@@ -1142,7 +1195,7 @@
                         <div class="card-title">Waypoints</div>
                         <div class="card-sub">Places the cats linger</div>
                     </div>
-                    <button class="toggle on" id="places-toggle" role="switch" aria-checked="true" aria-label="Show waypoints">
+                    <button class="toggle" id="places-toggle" role="switch" aria-checked="false" aria-label="Show waypoints">
                         <span class="knob"></span>
                     </button>
                 </div>

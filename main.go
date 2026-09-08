@@ -112,7 +112,7 @@ func runDaemon(cfg *Config) error {
 	worker := newSyncWorker(cfg, db, logger)
 
 	// Create scheduler
-	scheduler := newScheduler(cfg.SyncSchedule, worker, logger)
+	scheduler := newScheduler(cfg.SyncSchedule, cfg.TrackerStateInterval(), worker, logger)
 
 	// Setup signal handling for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
@@ -128,8 +128,10 @@ func runDaemon(cfg *Config) error {
 		apiServer = NewAPIServer(db, cfg, worker, cfg.HTTPListen, logger)
 		apiServerErr = make(chan error, 1)
 
-		// Push live updates to connected browsers after each successful sync.
+		// Push live updates to connected browsers after each successful sync,
+		// and whenever a collar switches on or off.
 		scheduler.onSyncComplete = apiServer.NotifyUpdate
+		scheduler.onStateChange = apiServer.NotifyUpdate
 
 		go func() {
 			if err := apiServer.Start(); err != nil {
@@ -144,7 +146,11 @@ func runDaemon(cfg *Config) error {
 		schedulerErr <- scheduler.Run(ctx)
 	}()
 
-	logger.Info("Daemon started", "schedule", cfg.SyncSchedule, "http_enabled", cfg.HTTPEnabled, "http_listen", cfg.HTTPListen)
+	logger.Info("Daemon started",
+		"schedule", cfg.SyncSchedule,
+		"tracker_state_interval", cfg.TrackerStateInterval(),
+		"http_enabled", cfg.HTTPEnabled,
+		"http_listen", cfg.HTTPListen)
 
 	// Wait for shutdown signal or errors
 	select {

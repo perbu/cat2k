@@ -49,6 +49,7 @@ Optional configuration:
 - `surehub_email`, `surehub_password` - SureHub credentials for pet flap status
 - `pois` - Array of points of interest `[{"name": "Place", "lat": 59.0, "lon": 10.0, "color": "#fff"}]`
 - `sync_schedule` - Cron expression (code default: `0 2 * * *` nightly at 2am; `config.example.json` ships `*/5 * * * *`)
+- `tracker_state_interval_s` - How often (seconds, default 60) to poll collar on/off state; 0 disables the poller (see power.go)
 - `http_listen` - HTTP server listen address (default: `:8080`, e.g., `127.0.0.1:8080` for localhost only)
 
 Copy `config.example.json` to `config.json` to get started.
@@ -66,13 +67,14 @@ Configuration loading from files and environment variables. Uses `loadConfig()` 
 ### worker.go (SyncWorker)
 Core sync logic that:
 - Authenticates with Weenect API using github.com/perbu/weenect-go client
-- Fetches tracker list and position data
+- Fetches tracker list and position data. The tracker list goes through `fetchTrackerStates()`, not `Client.GetTrackers()`: both hit `GET /mytracker`, but the client's typed `Tracker` keeps only id+name and drops the collar power fields (see power.go)
 - Splits large date ranges into 24-hour chunks (API limitation)
 - Stores positions idempotently in SQLite
 - Updates `last_sync_timestamp` after each successful chunk for resumability
 - Evaluates trapped / out-of-territory alerts after each successful sync (issue #7, see alerts.go); evaluation failures are logged, never fail the sync
 
 Key methods:
+- `SyncTrackerStates(ctx)` - Poll only the collars' on/off state, returning whether any changed. Unlike `TrySyncAll` it does not take `syncMu`, so a poll never blocks a scheduled sync (which would cost a whole cron period); the two touch disjoint state — power columns vs. positions/`last_sync_timestamp` — and the Weenect client and rate limiter are goroutine-safe
 - `SyncAll(ctx)` - Sync all trackers incrementally from last sync time
 - `SyncTracker(ctx, trackerID)` - Sync specific tracker
 - `BackfillAll(ctx, start, end)` - Backfill all trackers for date range
@@ -81,10 +83,10 @@ Key methods:
 
 ### database.go
 SQLite operations using modernc.org/sqlite driver. Six tables:
-- `trackers` - Tracker metadata with `last_sync_timestamp`
+- `trackers` - Tracker metadata with `last_sync_timestamp` and the polled collar on/off state in the `power_*` columns (power.go)
 - `positions` - GPS positions (idempotent inserts by position ID)
 - `sync_log` - Sync operation history
-- `waypoints` - Dwell-point waypoint identity + user-assigned names (issue #2); clustering itself is recomputed on demand, this table only makes names stick
+- `waypoints` - Dwell-point waypoint identity + user-assigned names (issue #2); clustering itself is recomputed on demand, this table only makes names stick; rows with no visit in 10 days are pruned (name included)
 - `behavior_models` - Fitted HMM parameters per tracker as a JSON blob (issue #5); refit on demand when stale so request-time decoding never refits
 - `alerts` - Alert event log (issue #7); one row per raised alert, `cleared_at IS NULL` marks the (single, per tracker+kind) active alert. Evaluation after each sync reconciles conditions against this table, so alert state survives restarts and the table doubles as the alert history
 
@@ -95,6 +97,14 @@ Key methods:
 
 All position inserts use `ON CONFLICT(id) DO UPDATE` on the extended quality/presence columns (radius, pdop, wifi_zone_id, …) so a re-backfill backfills them into historical rows; the insert stays idempotent because position IDs are stable. A migration in initDatabase adds the columns to pre-existing databases.
 
+### power.go
+Collar on/off state (`DevicePower`) — is the tracker actually switched on:
+- A gap in the position stream cannot answer this. The collars come off most evenings, which looks identical to a lost GSM signal or a cat simply sitting still. The authoritative fields live on Weenect's `GET /mytracker` payload — `position[0].is_online`, `off_reason`, `is_in_deep_sleep` — none of which weenect-go's `Tracker` type decodes, so `weenectTrackerState` decodes the raw body instead (`Client.DoRawRequest`)
+- States: `live`, `off` (Weenect named a cause in `off_reason`, e.g. `ALM-OFF` for the power button), `offline` (unreachable, no cause given), `sleeping` (deep sleep), `expired` (subscription lapsed — the collar may be on, but no data arrives either way), `unknown` (never polled; never rendered as a claim about the device)
+- Expiry is decided by the `active` flag alone: `remaining_days` legitimately hits zero on a renewal day, and calling a renewing subscription expired would blank the indicator for a working collar. `remaining_days` is still served so the UI can warn before a subscription silences a tracker
+- `TrackerState.Reported()` overlays staleness at response time (not at poll time, since it depends on now): a nominally-live collar whose newest fix has gone quiet for `powerStaleAfter` (15 min, against a 1 min reporting interval) is reported as `offline`
+- State is persisted in the `trackers` table's `power_*` columns, so it survives restarts and is served without an upstream call. `newPowerStatus()` renders it as the `power` object on `/api/trackers` and `/api/status`, returning nil when never polled
+
 ### gate.go
 Shared fix-quality gate (`ClassifyFix`): fixes are `FixInvalid` (no valid signal, or CMD-WIFIP WiFi-positioned fixes — sticky coordinates, zero satellites, neither GPS nor home-zone evidence), `FixHome` (snapped WiFi-zone fixes — "at home" evidence only), or `FixGPS` (usable for movement analytics). In-zone fixes are marked by `wifi_zone_id != 0`, not by type (the observed types are CMD-WBT/CMD-WBT-OUT and in-zone ALM-ON; the originally assumed CMD-X never occurs but is still mapped to FixHome as future-proofing). NULL `wifi_zone_id` (pre-migration rows) is "not home", never FixHome. All analytics must pass fixes through this gate; `FixHome` coordinates are snapped to the zone center and fabricate stillness.
 
@@ -102,7 +112,7 @@ Shared fix-quality gate (`ClassifyFix`): fixes are `FixInvalid` (no valid signal
 Dwell-point waypoints and territory transition graph (issue #2):
 - `detectDwellEpisodes()` groups consecutive gated GPS fixes within 30 m of an anchor into stationary episodes (min 3 min span, max 20 min fix gap)
 - `dbscanEpisodes()` clusters episode centroids (epsilon 20 m, minPoints 1, pure Go, O(n²))
-- `computeWaypoints()` aggregates clusters (dwell time, visits, hour-of-day histogram, last visit, share + previous-period share) and reconciles them with the `waypoints` table by centroid proximity (40 m match radius) so user names survive recomputation; unnamed waypoints get rank-based auto-labels ("Waypoint 1" = most dwelt)
+- `computeWaypoints()` aggregates clusters (dwell time, visits, hour-of-day histogram, last visit, share + previous-period share) and reconciles them with the `waypoints` table by centroid proximity (40 m match radius) so user names survive recomputation; unnamed waypoints get rank-based auto-labels ("Waypoint 1" = most dwelt). Waypoints whose last visit is older than `waypointPruneDays` (10 days) are pruned: the cluster is dropped from the response and the stored row (name included) is deleted; a revisited place is re-detected as a fresh waypoint
 - Transitions between consecutive episodes in different clusters form the directed territory graph
 
 ### kde.go
@@ -146,6 +156,8 @@ Trapped-cat / out-of-territory alerting (issue #7) — a transparent heuristic o
 ### scheduler.go
 Cron-based scheduling using github.com/robfig/cron/v3. Runs sync jobs on configured schedule with graceful shutdown support.
 
+Alongside the cron it runs the collar state poller (`runStatePoller`, `tracker_state_interval_s`, default 60s, immediate first poll so a fresh daemon is not `unknown` for a whole interval). It is deliberately separate from the sync cron: whether a tracker is switched on is a question about now, and the cron is coarse (nightly by default). A state change fires `onStateChange` — wired to `APIServer.NotifyUpdate` — so browsers learn a collar came off without waiting for the next position sync.
+
 ### ratelimit.go
 Token bucket rate limiter to respect API limits (default: 4 req/sec).
 
@@ -154,7 +166,7 @@ Structured logging using slog. Debug level logs all API requests/responses and r
 
 ### api.go
 HTTP API server providing:
-- `GET /api/trackers` - List all trackers with position counts
+- `GET /api/trackers` - List all trackers with position counts and a `power` object (collar on/off state, `off_reason`, `last_fix_at`, `checked_at`, `subscription_active`, `remaining_days`; absent when never polled — see power.go)
 - `GET /api/positions/{id}` - Get positions for a tracker (with date range query params)
 - `GET /api/status` - Radar status endpoint returning latest positions, home coords, POIs, and SureHub pet status
 - `GET /api/activity` - Per-cat daily activity summary
@@ -177,10 +189,18 @@ HTTP API server providing:
 - `GET /health` - Health check endpoint
 - Static file serving from `./web` directory
 
-The `/api/status` endpoint integrates with SureHub (github.com/perbu/go-sure) to fetch pet inside/outside status. Results are cached for 5 minutes to avoid excessive API calls. It also adds a per-tracker `presence: {state, since}` chip (issue #4) derived from WiFi-zone data alone — the flap status stays display-only (see presence.go) — and an `alerts` array of active trapped/out-of-territory alerts (issue #7: `{id, tracker_id, name, kind, since, lat, lon, radius}`) for the status-page banner.
+The `/api/status` endpoint integrates with SureHub (github.com/perbu/go-sure) to fetch pet inside/outside status. Results are cached for 5 minutes to avoid excessive API calls. It also adds a per-tracker `presence: {state, since}` chip (issue #4) derived from WiFi-zone data alone — the flap status stays display-only (see presence.go) — and an `alerts` array of active trapped/out-of-territory alerts (issue #7: `{id, tracker_id, name, kind, since, lat, lon, radius}`) for the status-page banner. Each tracker also carries the same `power` object as `/api/trackers` (power.go); `web/status.html` does not read it yet.
 
 ### web/index.html + web/app.js
-Leaflet map view: per-cat heatmaps, recent-movement trails, activity cat cards,
+Leaflet map view: per-cat heatmaps, recent-movement trails, activity cat cards
+(each carrying the collar's on/off state from `/api/trackers`' `power` object:
+a hollow dot plus an `off` / `no signal` / `asleep` / `no sub` pill, prose
+replacing "Last seen" with the cause and how long since the last fix, dimmed
+battery and bars because those readouts are last-known rather than current,
+and an amber warning when a subscription is within a week of silencing a
+working collar — see power.go; `refreshTrackers()` re-fetches the roster on
+every SSE update so the indicator reacts as soon as a collar switches, and the
+cards re-render each minute so the durations stay truthful),
 plus the waypoint layer (markers sized by dwell share, per-cat accent colors,
 click for stats popup with rename), the toggleable transition-graph overlay
 (curved directed edges, width ∝ probability), and a "Top places" sidebar panel
@@ -228,6 +248,8 @@ Radar-style status page showing:
 **24-hour chunking**: API has 24h max range. `fetchAndStorePositions()` automatically splits larger ranges and updates sync time after each chunk.
 
 **Rate limiting**: All API calls go through `rateLimiter.Wait()` before execution.
+
+**Device state vs. position data**: Anything about the tracker itself — is it on, is the subscription alive — comes from Weenect's tracker endpoint and is stored on the `trackers` row, never inferred from the shape of the position stream (power.go explains why). Positions describe the cat; the `power_*` columns describe the collar.
 
 ## Testing Changes
 

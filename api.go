@@ -328,6 +328,14 @@ func (a *APIServer) handleGetTrackers(w http.ResponseWriter, r *http.Request) {
 		trackers = []TrackerWithCount{}
 	}
 
+	// Render the polled collar state, overlaying staleness against now
+	// (power.go), so the left rail can distinguish a switched-off tracker
+	// from one that is merely between fixes.
+	now := time.Now()
+	for i := range trackers {
+		trackers[i].Power = newPowerStatus(trackers[i].State, now)
+	}
+
 	a.writeJSON(w, http.StatusOK, map[string]interface{}{
 		"trackers": trackers,
 	})
@@ -452,6 +460,7 @@ type TrackerStatus struct {
 	IsInside  *bool           `json:"is_inside,omitempty"` // From SureHub pet flap
 	LastFlap  *string         `json:"last_flap,omitempty"` // Time of last flap activity
 	Presence  *PresenceStatus `json:"presence,omitempty"`  // WiFi-zone state (issue #4)
+	Power     *PowerStatus    `json:"power,omitempty"`     // Collar on/off state (power.go)
 	History   []HistoryPoint  `json:"history,omitempty"`   // Recent position history for trail
 }
 
@@ -518,6 +527,7 @@ func (a *APIServer) handleGetStatus(w http.ResponseWriter, r *http.Request) {
 			Lon:       p.Longitude,
 			Battery:   p.Battery,
 			Timestamp: p.Timestamp,
+			Power:     newPowerStatus(p.State, time.Now()),
 		}
 
 		// Fetch recent position history for trail

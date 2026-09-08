@@ -57,6 +57,7 @@ export WEENECT_DATABASE_PATH="./catboard.db"
 export WEENECT_RATE_LIMIT="4.0"
 export WEENECT_BACKFILL_START_DATE="2024-01-01"
 export WEENECT_SYNC_SCHEDULE="0 2 * * *"  # Cron format
+export WEENECT_TRACKER_STATE_INTERVAL_S="60"
 export WEENECT_LOG_LEVEL="info"
 ```
 
@@ -72,6 +73,7 @@ Copy `config.example.json` to one of the default locations (e.g., `./config.json
   "rate_limit": 4.0,
   "backfill_start_date": "2024-01-01",
   "sync_schedule": "0 2 * * *",
+  "tracker_state_interval_s": 60,
   "log_level": "info",
   "http_listen": ":8080",
   "home_lat": 59.0,
@@ -85,6 +87,14 @@ Copy `config.example.json` to one of the default locations (e.g., `./config.json
 `home_lat`/`home_lon` center the radar status page; `surehub_*` enables pet flap
 inside/outside status; `pois` adds markers to the radar; `http_listen` sets the
 web UI address (use `127.0.0.1:8080` to bind localhost only). All are optional.
+
+`tracker_state_interval_s` (default 60, 0 to disable) is how often the collars'
+on/off state is polled. This runs separately from `sync_schedule` because
+whether a tracker is switched on is a question about right now, while positions
+can lag behind: a collar that has been taken off looks exactly like one that
+lost signal if all you have is a gap in the position stream. It costs one
+request per interval, and the web UI is pushed an update the moment a collar
+switches on or off.
 
 The daemon will automatically find and use it. If you need a custom location:
 

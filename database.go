@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -92,10 +93,20 @@ type TrackerStats struct {
 }
 
 const schema = `
+-- The power/* columns hold the collar's own reporting state as last polled
+-- from Weenect's tracker endpoint (see power.go). They are device state, not
+-- position data: a switched-off collar is indistinguishable from one that has
+-- lost coverage if all you have is a gap in positions.
 CREATE TABLE IF NOT EXISTS trackers (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL,
   last_sync_timestamp DATETIME,
+  power TEXT,
+  power_off_reason TEXT,
+  power_subscription_active BOOLEAN,
+  power_remaining_days INTEGER,
+  power_last_fix_at DATETIME,
+  power_checked_at DATETIME,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -279,22 +290,35 @@ func initDatabase(dbPath string) (*Database, error) {
 	}
 
 	// CREATE TABLE IF NOT EXISTS does not add columns to databases created
-	// before the extended position fields (issue #1) were introduced.
-	if err := migratePositionsTable(db); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to migrate positions table: %w", err)
+	// before the extended position fields (issue #1) or the tracker power
+	// state were introduced.
+	for _, m := range []struct {
+		table string
+		cols  []tableColumn
+	}{
+		{"positions", positionColumns},
+		{"trackers", trackerColumns},
+	} {
+		if err := migrateTable(db, m.table, m.cols); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to migrate %s table: %w", m.table, err)
+		}
 	}
 
 	return &Database{db: db}, nil
 }
 
-// positionColumns lists every column of the positions table added after the
-// original schema, with its DDL definition. Fresh databases get these from the
-// CREATE TABLE statement; existing databases get them via ALTER TABLE here.
-var positionColumns = []struct {
+// tableColumn is a column added to a table after its original schema, with the
+// DDL that defines it. Fresh databases get these from the CREATE TABLE
+// statement; existing databases get them via ALTER TABLE in migrateTable.
+type tableColumn struct {
 	name string
 	ddl  string
-}{
+}
+
+// positionColumns lists the extended per-fix quality and presence columns
+// (issue #1).
+var positionColumns = []tableColumn{
 	{"radius", "radius INTEGER"},
 	{"pdop", "pdop REAL"},
 	{"wifi_zone_id", "wifi_zone_id INTEGER"},
@@ -308,10 +332,20 @@ var positionColumns = []struct {
 	{"off_reason", "off_reason TEXT"},
 }
 
-// migratePositionsTable adds any missing extended columns to an existing
-// positions table. Idempotent: columns that already exist are skipped.
-func migratePositionsTable(db *sql.DB) error {
-	rows, err := db.Query("PRAGMA table_info(positions)")
+// trackerColumns lists the polled collar power-state columns (power.go).
+var trackerColumns = []tableColumn{
+	{"power", "power TEXT"},
+	{"power_off_reason", "power_off_reason TEXT"},
+	{"power_subscription_active", "power_subscription_active BOOLEAN"},
+	{"power_remaining_days", "power_remaining_days INTEGER"},
+	{"power_last_fix_at", "power_last_fix_at DATETIME"},
+	{"power_checked_at", "power_checked_at DATETIME"},
+}
+
+// migrateTable adds any missing columns to an existing table. Idempotent:
+// columns that already exist are skipped.
+func migrateTable(db *sql.DB, table string, cols []tableColumn) error {
+	rows, err := db.Query("PRAGMA table_info(" + table + ")")
 	if err != nil {
 		return err
 	}
@@ -333,11 +367,11 @@ func migratePositionsTable(db *sql.DB) error {
 		return err
 	}
 
-	for _, col := range positionColumns {
+	for _, col := range cols {
 		if existing[col.name] {
 			continue
 		}
-		if _, err := db.Exec("ALTER TABLE positions ADD COLUMN " + col.ddl); err != nil {
+		if _, err := db.Exec("ALTER TABLE " + table + " ADD COLUMN " + col.ddl); err != nil {
 			return fmt.Errorf("failed to add column %s: %w", col.name, err)
 		}
 	}
@@ -350,18 +384,97 @@ func (d *Database) Close() error {
 	return d.db.Close()
 }
 
-// UpsertTracker inserts or updates a tracker
-func (d *Database) UpsertTracker(id int, name string) error {
+// UpsertTrackerState stores a tracker's identity together with the collar
+// power state just polled from Weenect, and returns the power state it
+// replaced. Callers use the previous value to log and notify only on real
+// transitions; a tracker seen for the first time returns PowerUnknown.
+func (d *Database) UpsertTrackerState(id int, name string, s TrackerState) (DevicePower, error) {
+	prev, err := d.GetTrackerPower(id)
+	if err != nil {
+		return PowerUnknown, err
+	}
+
+	var lastFix *time.Time
+	if !s.LastFixAt.IsZero() {
+		t := s.LastFixAt
+		lastFix = &t
+	}
+
 	query := `
-		INSERT INTO trackers (id, name, created_at, updated_at)
-		VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+		INSERT INTO trackers (
+			id, name, power, power_off_reason, power_subscription_active,
+			power_remaining_days, power_last_fix_at, power_checked_at,
+			created_at, updated_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
 		ON CONFLICT(id) DO UPDATE SET
 			name = excluded.name,
+			power = excluded.power,
+			power_off_reason = excluded.power_off_reason,
+			power_subscription_active = excluded.power_subscription_active,
+			power_remaining_days = excluded.power_remaining_days,
+			power_last_fix_at = excluded.power_last_fix_at,
+			power_checked_at = excluded.power_checked_at,
 			updated_at = CURRENT_TIMESTAMP
 	`
-	_, err := d.db.Exec(query, id, name)
-	return err
+	_, err = d.db.Exec(query, id, name, string(s.Power), s.OffReason,
+		s.SubscriptionActive, s.RemainingDays, lastFix, s.CheckedAt)
+	if err != nil {
+		return PowerUnknown, err
+	}
+
+	return prev, nil
 }
+
+// GetTrackerPower returns a tracker's stored power state, or PowerUnknown if
+// the tracker is absent or has never been polled.
+func (d *Database) GetTrackerPower(id int) (DevicePower, error) {
+	var power sql.NullString
+	err := d.db.QueryRow("SELECT power FROM trackers WHERE id = ?", id).Scan(&power)
+	if errors.Is(err, sql.ErrNoRows) {
+		return PowerUnknown, nil
+	}
+	if err != nil {
+		return PowerUnknown, err
+	}
+	if !power.Valid || power.String == "" {
+		return PowerUnknown, nil
+	}
+	return DevicePower(power.String), nil
+}
+
+// scanTrackerState reads the power columns in the order trackerStateColumns
+// selects them. A row with no stored poll yields a zero-valued state whose
+// Power is PowerUnknown, so callers never mistake "not yet polled" for a
+// claim about the device.
+func scanTrackerState(power, offReason sql.NullString, subActive, remainingDays sql.NullInt64, lastFix, checkedAt sql.NullTime) TrackerState {
+	s := TrackerState{Power: PowerUnknown}
+	if power.Valid && power.String != "" {
+		s.Power = DevicePower(power.String)
+	}
+	if offReason.Valid && offReason.String != "" {
+		r := offReason.String
+		s.OffReason = &r
+	}
+	if subActive.Valid {
+		s.SubscriptionActive = subActive.Int64 != 0
+	}
+	if remainingDays.Valid {
+		s.RemainingDays = int(remainingDays.Int64)
+	}
+	if lastFix.Valid {
+		s.LastFixAt = lastFix.Time
+	}
+	if checkedAt.Valid {
+		s.CheckedAt = checkedAt.Time
+	}
+	return s
+}
+
+// trackerStateColumns is the SELECT list scanTrackerState expects, so the
+// queries that join in tracker power state stay in step with the scanner.
+const trackerStateColumns = `t.power, t.power_off_reason, t.power_subscription_active,
+			t.power_remaining_days, t.power_last_fix_at, t.power_checked_at`
 
 // GetTracker retrieves a tracker by ID
 func (d *Database) GetTracker(id int) (*TrackerRecord, error) {
@@ -556,16 +669,24 @@ type TrackerWithCount struct {
 	Name          string    `json:"name"`
 	LastSync      time.Time `json:"last_sync"`
 	PositionCount int       `json:"position_count"`
+	// State is the collar's polled reporting state. Not serialized directly;
+	// handlers overlay staleness and emit it as Power.
+	State TrackerState `json:"-"`
+	// Power is the serialized form of State, filled in by the API handler
+	// (which knows "now"); nil when the tracker has never been polled.
+	Power *PowerStatus `json:"power,omitempty"`
 }
 
-// GetAllTrackers retrieves all trackers with position counts
+// GetAllTrackers retrieves all trackers with position counts and the collar
+// power state from the last poll.
 func (d *Database) GetAllTrackers() ([]TrackerWithCount, error) {
 	query := `
 		SELECT
 			t.id,
 			t.name,
 			t.last_sync_timestamp,
-			COUNT(p.id) as position_count
+			COUNT(p.id) as position_count,
+			` + trackerStateColumns + `
 		FROM trackers t
 		LEFT JOIN positions p ON t.id = p.tracker_id
 		GROUP BY t.id
@@ -582,13 +703,18 @@ func (d *Database) GetAllTrackers() ([]TrackerWithCount, error) {
 	for rows.Next() {
 		var t TrackerWithCount
 		var lastSync sql.NullTime
-		err := rows.Scan(&t.ID, &t.Name, &lastSync, &t.PositionCount)
+		var power, offReason sql.NullString
+		var subActive, remainingDays sql.NullInt64
+		var lastFix, checkedAt sql.NullTime
+		err := rows.Scan(&t.ID, &t.Name, &lastSync, &t.PositionCount,
+			&power, &offReason, &subActive, &remainingDays, &lastFix, &checkedAt)
 		if err != nil {
 			return nil, err
 		}
 		if lastSync.Valid {
 			t.LastSync = lastSync.Time
 		}
+		t.State = scanTrackerState(power, offReason, subActive, remainingDays, lastFix, checkedAt)
 		trackers = append(trackers, t)
 	}
 
@@ -647,6 +773,9 @@ type LatestPosition struct {
 	Longitude   float64   `json:"lon"`
 	Timestamp   time.Time `json:"timestamp"`
 	Battery     *int      `json:"battery,omitempty"`
+	// State is the collar's polled reporting state (power.go), carried along
+	// so the radar can mark a fix as last-known rather than current.
+	State TrackerState `json:"-"`
 }
 
 // GetRecentPositions returns positions for a tracker within a time window
@@ -765,7 +894,8 @@ func (d *Database) GetPositionsForActivity(since time.Time) (map[int][]ActivityP
 // GetLatestPositions returns the most recent position for each tracker
 func (d *Database) GetLatestPositions() ([]LatestPosition, error) {
 	query := `
-		SELECT t.id, t.name, p.latitude, p.longitude, p.timestamp, p.battery
+		SELECT t.id, t.name, p.latitude, p.longitude, p.timestamp, p.battery,
+			` + trackerStateColumns + `
 		FROM trackers t
 		INNER JOIN positions p ON t.id = p.tracker_id
 		WHERE p.timestamp = (
@@ -785,10 +915,15 @@ func (d *Database) GetLatestPositions() ([]LatestPosition, error) {
 	var positions []LatestPosition
 	for rows.Next() {
 		var p LatestPosition
-		err := rows.Scan(&p.TrackerID, &p.TrackerName, &p.Latitude, &p.Longitude, &p.Timestamp, &p.Battery)
+		var power, offReason sql.NullString
+		var subActive, remainingDays sql.NullInt64
+		var lastFix, checkedAt sql.NullTime
+		err := rows.Scan(&p.TrackerID, &p.TrackerName, &p.Latitude, &p.Longitude, &p.Timestamp, &p.Battery,
+			&power, &offReason, &subActive, &remainingDays, &lastFix, &checkedAt)
 		if err != nil {
 			return nil, err
 		}
+		p.State = scanTrackerState(power, offReason, subActive, remainingDays, lastFix, checkedAt)
 		positions = append(positions, p)
 	}
 
@@ -861,6 +996,13 @@ func (d *Database) CreateWaypoint(trackerID int, lat, lon float64) (int64, error
 		return 0, err
 	}
 	return res.LastInsertId()
+}
+
+// DeleteWaypoint removes a stored waypoint, e.g. when pruning a place that
+// has not been visited within the prune horizon.
+func (d *Database) DeleteWaypoint(id int64) error {
+	_, err := d.db.Exec(`DELETE FROM waypoints WHERE id = ?`, id)
+	return err
 }
 
 // UpdateWaypointLocation refreshes a stored waypoint's centroid after a

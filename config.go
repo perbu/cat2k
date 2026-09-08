@@ -25,6 +25,14 @@ type Config struct {
 	// Sync schedule (cron format or "nightly")
 	SyncSchedule string `json:"sync_schedule"`
 
+	// TrackerStateIntervalS is how often, in seconds, the collars' on/off
+	// state is polled from Weenect's tracker endpoint (power.go). It runs
+	// separately from the position sync because "is the tracker switched on"
+	// is a question about now, while positions can lag. One request per
+	// interval, well inside the rate limit. Zero disables the poller, leaving
+	// power state to refresh with each position sync.
+	TrackerStateIntervalS int `json:"tracker_state_interval_s"`
+
 	// Logging
 	LogLevel string `json:"log_level"` // debug, info, warn, error
 
@@ -65,6 +73,15 @@ func (c *Config) ActivityLocation() (*time.Location, error) {
 	return loc, nil
 }
 
+// TrackerStateInterval returns the collar power-state poll interval, or zero
+// when polling is disabled.
+func (c *Config) TrackerStateInterval() time.Duration {
+	if c.TrackerStateIntervalS <= 0 {
+		return 0
+	}
+	return time.Duration(c.TrackerStateIntervalS) * time.Second
+}
+
 // POI represents a point of interest on the radar
 type POI struct {
 	Name  string  `json:"name"`
@@ -76,14 +93,15 @@ type POI struct {
 // DefaultConfig returns a config with sensible defaults
 func DefaultConfig() *Config {
 	return &Config{
-		DatabasePath:      "./catboard.db",
-		RateLimit:         4.0, // 4 requests per second
-		BackfillStartDate: time.Now().AddDate(0, 0, -30).Format("2006-01-02"), // Last 30 days
-		SyncSchedule:      "0 2 * * *", // 2am daily (cron format)
-		LogLevel:          "info",
-		HTTPListen:        ":8080",
-		HTTPEnabled:       true,
-		HeatmapDays:       60, // Last 60 days for heatmap
+		DatabasePath:          "./catboard.db",
+		RateLimit:             4.0,                                                // 4 requests per second
+		BackfillStartDate:     time.Now().AddDate(0, 0, -30).Format("2006-01-02"), // Last 30 days
+		SyncSchedule:          "0 2 * * *",                                        // 2am daily (cron format)
+		TrackerStateIntervalS: 60,                                                 // poll collar on/off state every minute
+		LogLevel:              "info",
+		HTTPListen:            ":8080",
+		HTTPEnabled:           true,
+		HeatmapDays:           60, // Last 60 days for heatmap
 	}
 }
 
@@ -150,6 +168,12 @@ func loadConfig(configPath string) (*Config, error) {
 	}
 	if val := os.Getenv("WEENECT_SYNC_SCHEDULE"); val != "" {
 		cfg.SyncSchedule = val
+	}
+	if val := os.Getenv("WEENECT_TRACKER_STATE_INTERVAL_S"); val != "" {
+		var interval int
+		if _, err := fmt.Sscanf(val, "%d", &interval); err == nil {
+			cfg.TrackerStateIntervalS = interval
+		}
 	}
 	if val := os.Getenv("WEENECT_LOG_LEVEL"); val != "" {
 		cfg.LogLevel = val

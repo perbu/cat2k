@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -53,6 +54,85 @@ func newSyncWorker(cfg *Config, db *Database, logger *slog.Logger) *SyncWorker {
 	}
 }
 
+// fetchTrackerStates lists the account's trackers with the collar power state
+// Weenect reports alongside them.
+//
+// It stands in for Client.GetTrackers, which decodes the same GET /mytracker
+// response into a type carrying only id and name — discarding is_online,
+// off_reason and is_in_deep_sleep, the only authoritative answer to "is the
+// tracker switched on". The raw body is decoded into weenectTrackerState
+// instead (power.go).
+func (w *SyncWorker) fetchTrackerStates(ctx context.Context) ([]weenectTrackerState, error) {
+	if err := w.rateLimiter.Wait(ctx); err != nil {
+		return nil, err
+	}
+
+	w.logger.Debug("API request: get trackers")
+	body, err := w.client.DoRawRequest(ctx, "GET", "mytracker", nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get trackers: %w", err)
+	}
+
+	var resp struct {
+		Items []weenectTrackerState `json:"items"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("failed to decode trackers: %w", err)
+	}
+	w.logger.Debug("API response: got trackers", "count", len(resp.Items))
+
+	return resp.Items, nil
+}
+
+// SyncTrackerStates polls only the collars' power state and stores it,
+// reporting whether any tracker changed state. It is deliberately independent
+// of the position sync: positions run on the cron (nightly by default), which
+// is far too coarse for "is the tracker on right now", and this costs a single
+// request.
+//
+// Unlike TrySyncAll it does not take syncMu, so a poll never blocks a
+// scheduled sync (which would cost a whole cron period — a full night on the
+// default schedule). The two are safe to overlap: this touches only the
+// tracker row's power columns, never positions or last_sync_timestamp, and
+// both the Weenect client's token and the rate limiter are goroutine-safe.
+// Worst case a poll and a sync store the same upstream truth twice.
+func (w *SyncWorker) SyncTrackerStates(ctx context.Context) (bool, error) {
+	trackers, err := w.fetchTrackerStates(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	changed := false
+	for _, tracker := range trackers {
+		state := tracker.state(time.Now())
+		prev, err := w.db.UpsertTrackerState(tracker.ID, tracker.Name, state)
+		if err != nil {
+			return changed, fmt.Errorf("failed to store tracker state for %d: %w", tracker.ID, err)
+		}
+		if prev == state.Power {
+			continue
+		}
+		changed = true
+		w.logger.Info("Tracker power state changed",
+			"tracker_id", tracker.ID,
+			"name", tracker.Name,
+			"from", prev,
+			"to", state.Power,
+			"off_reason", derefOr(state.OffReason, ""),
+		)
+	}
+
+	return changed, nil
+}
+
+// derefOr returns *p, or def when p is nil.
+func derefOr[T any](p *T, def T) T {
+	if p == nil {
+		return def
+	}
+	return *p
+}
+
 // SyncAll syncs all trackers
 func (w *SyncWorker) SyncAll(ctx context.Context) error {
 	w.logger.Info("Starting sync for all trackers")
@@ -68,27 +148,23 @@ func (w *SyncWorker) SyncAll(ctx context.Context) error {
 	}
 	w.logger.Debug("API response: login successful")
 
-	// Get all trackers
-	if err := w.rateLimiter.Wait(ctx); err != nil {
+	// Get all trackers, along with the collar power state the same response
+	// carries (power.go).
+	trackers, err := w.fetchTrackerStates(ctx)
+	if err != nil {
 		return err
 	}
-	w.logger.Debug("API request: get trackers")
-	trackers, err := w.client.GetTrackers(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get trackers: %w", err)
-	}
-	w.logger.Debug("API response: got trackers", "count", len(trackers.Items))
 
-	w.logger.Info("Found trackers", "count", len(trackers.Items))
+	w.logger.Info("Found trackers", "count", len(trackers))
 
 	totalPositions := 0
 	successCount := 0
 	errorCount := 0
 
 	// Sync each tracker
-	for _, tracker := range trackers.Items {
-		// Update tracker in database
-		if err := w.db.UpsertTracker(tracker.ID, tracker.Name); err != nil {
+	for _, tracker := range trackers {
+		// Update tracker identity and power state in database
+		if _, err := w.db.UpsertTrackerState(tracker.ID, tracker.Name, tracker.state(time.Now())); err != nil {
 			w.logger.Error("Failed to upsert tracker", "tracker_id", tracker.ID, "error", err)
 			errorCount++
 			continue
@@ -233,18 +309,13 @@ func (w *SyncWorker) BackfillAll(ctx context.Context, startDate, endDate time.Ti
 	w.logger.Debug("API response: login successful")
 
 	// Get all trackers
-	if err := w.rateLimiter.Wait(ctx); err != nil {
+	trackers, err := w.fetchTrackerStates(ctx)
+	if err != nil {
 		return err
 	}
-	w.logger.Debug("API request: get trackers")
-	trackers, err := w.client.GetTrackers(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get trackers: %w", err)
-	}
-	w.logger.Debug("API response: got trackers", "count", len(trackers.Items))
 
-	for _, tracker := range trackers.Items {
-		if err := w.db.UpsertTracker(tracker.ID, tracker.Name); err != nil {
+	for _, tracker := range trackers {
+		if _, err := w.db.UpsertTrackerState(tracker.ID, tracker.Name, tracker.state(time.Now())); err != nil {
 			w.logger.Error("Failed to upsert tracker", "tracker_id", tracker.ID, "error", err)
 			continue
 		}

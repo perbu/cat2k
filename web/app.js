@@ -50,6 +50,7 @@ let positionsByTracker = {}; // trackerId -> positions[]
 let activityData = null;     // most recent /api/activity response
 let pois = [];               // points of interest from /api/status
 let heatMapSettings = {
+    enabled: true,           // heat map layer on the map
     auto: true,              // "Auto-tune" toggle — derive from zoom/density
     intensity: 0.3,
     radius: 25,
@@ -60,7 +61,7 @@ let transitionsByTracker = {}; // trackerId -> edges[] from /api/waypoints/trans
 let waypointMarkers = {};      // trackerId -> L.layerGroup of waypoint markers
 let routeLayers = {};          // trackerId -> L.layerGroup of transition edges
 let waypointSettings = {
-    places: true,              // waypoint markers on the map
+    places: false,             // waypoint markers on the map (busy — opt-in)
     routes: false              // transition-graph overlay
 };
 let rangeByTracker = {};       // trackerId -> /api/range response
@@ -376,6 +377,41 @@ function relativeTime(date) {
     return `${days} d ago`;
 }
 
+// How each collar reporting state (power.go) reads on a cat card: the pill
+// label, and the prose that replaces "Last seen" once the collar stops
+// reporting. `quiet` states dim the card's last-known readouts.
+//
+// Only `live` is a claim that the data is current. `unknown` means the daemon
+// has not polled Weenect yet, so the card falls back to plain last-seen text
+// rather than asserting anything about the device.
+const POWER_STATES = {
+    live:     { quiet: false },
+    off:      { quiet: true,  pill: 'off',       lead: 'Switched off' },
+    offline:  { quiet: true,  pill: 'no signal', lead: 'Out of contact' },
+    sleeping: { quiet: true,  pill: 'asleep',    lead: 'In deep sleep' },
+    expired:  { quiet: true,  pill: 'no sub',    lead: 'Subscription expired', warn: true },
+    unknown:  { quiet: false }
+};
+
+// Weenect's off_reason codes, for the cases where the cause is worth naming.
+// An unrecognized code is shown verbatim rather than guessed at.
+const OFF_REASONS = {
+    'ALM-OFF': 'Switched off',
+    'ALM-BAT': 'Battery ran out'
+};
+
+// Resolve a tracker's reporting state into the pieces the card needs. Called
+// with the `power` object from /api/trackers, which is absent on a database
+// that predates the first state poll.
+function powerPresentation(power) {
+    const spec = POWER_STATES[power?.state] || POWER_STATES.unknown;
+    let lead = spec.lead;
+    if (power?.state === 'off' && power.off_reason) {
+        lead = OFF_REASONS[power.off_reason] || `Switched off (${power.off_reason})`;
+    }
+    return { ...spec, lead };
+}
+
 // Battery pill markup: a shell whose inner fill width is the charge %, followed
 // by the percentage in mono. Turns amber below 20% (DESIGN.md battery rule).
 function batteryPill(pct) {
@@ -428,14 +464,41 @@ function renderCatCards() {
         const positions = positionsByTracker[tracker.id] || [];
         const latest = positions[0];
         const battery = latest ? batteryPill(latest.battery) : batteryPill(null);
+
+        // Whether the collar is on comes from Weenect's own device state, not
+        // from the age of our newest fix — the collars come off most evenings,
+        // and that looks identical to a lost signal from the position stream
+        // alone. Prefer the upstream fix time for "since": it is the newest
+        // fix Weenect holds, so it beats our last synced one.
+        const power = tracker.power;
+        const state = powerPresentation(power);
+        const fixAt = power?.last_fix_at ? new Date(power.last_fix_at)
+            : (latest ? new Date(latest.timestamp) : null);
+
         let lastSeen = 'No recent fixes';
-        if (latest) {
-            lastSeen = `Last seen ${relativeTime(new Date(latest.timestamp))}`;
-            const near = nearestPOI(latest.lat, latest.lng);
+        if (state.lead) {
+            lastSeen = fixAt
+                ? `${state.lead} · last fix ${relativeTime(fixAt)}`
+                : state.lead;
+        } else if (fixAt) {
+            lastSeen = `Last seen ${relativeTime(fixAt)}`;
+            const near = latest ? nearestPOI(latest.lat, latest.lng) : null;
             if (near) {
                 lastSeen += ` · ${formatDistance(near.dist)} from ${near.poi.name}`;
             }
         }
+
+        // A subscription running out silences a perfectly good collar, so warn
+        // before it does rather than only once it has.
+        const daysLeft = power?.subscription_active ? power.remaining_days : null;
+        if (daysLeft !== null && daysLeft !== undefined && daysLeft <= 7) {
+            const d = daysLeft <= 0 ? 'today' : `in ${daysLeft} d`;
+            lastSeen += ` · <span class="cat-sub-warn">subscription ends ${d}</span>`;
+        }
+
+        const pill = state.pill
+            ? `<span class="cat-state${state.warn ? ' warn' : ''}">${state.pill}</span>`
+            : '';
 
         // Bars: height = share of the cat's own peak day. Last bar (today) uses
         // the full accent; earlier days use the muted accent tint.
@@ -473,10 +536,11 @@ function renderCatCards() {
             </div>` : '';
 
         return `
-            <div class="cat-card">
+            <div class="cat-card${state.quiet ? ' quiet' : ''}">
                 <div class="cat-top">
-                    <span class="cat-dot" style="background:${accent.color}"></span>
+                    <span class="cat-dot${state.quiet ? ' quiet' : ''}" style="background:${accent.color};--dot-accent:${accent.color}"></span>
                     <span class="cat-name">${tracker.name}</span>
+                    ${pill}
                     ${battery}
                 </div>
                 <div class="cat-meta">${lastSeen}</div>
@@ -546,6 +610,22 @@ async function loadPOIs() {
         renderCatCards();
     } catch (err) {
         console.error('Error loading POIs:', err);
+    }
+}
+
+// Re-fetch the tracker roster so the cards pick up fresh collar power state.
+// The daemon pushes an SSE update the moment a collar switches on or off, so
+// this is what makes the indicator react in near real time rather than only
+// on page load. Swallows errors — the previous roster stays on screen, and
+// its own timestamps show it is not fresh.
+async function refreshTrackers() {
+    try {
+        const trackers = await fetchTrackers();
+        if (trackers.length === 0) return;
+        allTrackers = trackers;
+        renderCatCards();
+    } catch (err) {
+        console.error('Error refreshing trackers:', err);
     }
 }
 
@@ -1646,13 +1726,15 @@ function renderHeatMaps(resetView = true) {
         const palette = paletteForIndex(trackerPaletteIndex(id));
         const heatData = positions.map(pos => [pos.lat, pos.lng, heatMapSettings.intensity]);
 
-        heatLayers[id] = L.heatLayer(heatData, {
-            radius: heatMapSettings.radius,
-            blur: heatMapSettings.blur,
-            maxZoom: 17,
-            max: 3.0,
-            gradient: palette
-        }).addTo(map);
+        if (heatMapSettings.enabled) {
+            heatLayers[id] = L.heatLayer(heatData, {
+                radius: heatMapSettings.radius,
+                blur: heatMapSettings.blur,
+                maxZoom: 17,
+                max: 3.0,
+                gradient: palette
+            }).addTo(map);
+        }
 
         const tracker = allTrackers.find(t => t.id === id);
         const latest = positions[0];
@@ -1802,6 +1884,17 @@ function setupEventListeners() {
         }
     });
 
+    // Heat map visibility toggle: re-render from cached positions, no refetch.
+    const heatmapToggle = document.getElementById('heatmap-toggle');
+    if (heatmapToggle) {
+        heatmapToggle.addEventListener('click', () => {
+            heatMapSettings.enabled = !heatMapSettings.enabled;
+            heatmapToggle.classList.toggle('on', heatMapSettings.enabled);
+            heatmapToggle.setAttribute('aria-checked', String(heatMapSettings.enabled));
+            renderHeatMaps(false);
+        });
+    }
+
     // Auto-tune toggle: when on, settings derive from zoom/density and the
     // slider group is inert; when off, the sliders drive the heat map by hand.
     const toggle = document.getElementById('autotune-toggle');
@@ -1936,6 +2029,7 @@ function initLiveUpdates() {
         const es = new EventSource(`${API_BASE}/api/events`);
         es.addEventListener('update', (e) => {
             if (e.data === 'connected') return;
+            refreshTrackers();
             loadAllTrackerData();
             loadActivity();
             loadWaypoints();
@@ -1948,6 +2042,12 @@ function initLiveUpdates() {
     } catch (err) {
         console.error('Live updates unavailable:', err);
     }
+
+    // The cards' "last fix 3 h ago" wording ages even when nothing new
+    // arrives, and a collar that is off produces no events at all. Re-render
+    // from cached data every minute so those durations stay truthful without
+    // refetching anything.
+    setInterval(renderCatCards, 60 * 1000);
 }
 
 // Main initialization function

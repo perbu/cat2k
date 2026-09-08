@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"sort"
 	"time"
 )
@@ -22,6 +23,13 @@ import (
 // and name and get their centroid refreshed; unmatched clusters insert a new
 // row. Unnamed waypoints get a rank-based auto-label ("Waypoint 1" = most
 // dwelt).
+//
+// Pruning: a place the cat has abandoned should not accumulate forever.
+// Clusters whose last visit is older than waypointPruneDays are dropped from
+// the response (and their stored row, if any, is deleted — the name goes with
+// it), and stored rows matched by no cluster are deleted when no episode in
+// the last waypointPruneDays lies near them. A genuinely revisited place is
+// simply re-detected as a fresh waypoint.
 
 const (
 	// dwellStationaryRadiusM: a fix within this distance of the episode's
@@ -39,6 +47,10 @@ const (
 	// centroid and a stored waypoint for them to count as the same place.
 	// Roughly 2x epsilon: recomputed centroids drift as new data arrives.
 	dwellMatchRadiusM = 40.0
+	// waypointPruneDays: a waypoint with no dwell episode near it in this
+	// many days is pruned — dropped from the response and deleted from the
+	// waypoints table, name included.
+	waypointPruneDays = 10
 )
 
 // DwellPosition is a position with the fields needed to gate and cluster it.
@@ -182,16 +194,31 @@ func (d *Database) computeWaypoints(trackerID, days int, loc *time.Location) ([]
 	now := time.Now()
 	since := now.AddDate(0, 0, -days)
 	prevSince := now.AddDate(0, 0, -2*days)
+	pruneCutoff := now.AddDate(0, 0, -waypointPruneDays)
 
-	fixes, err := d.GetPositionsForDwell(trackerID, prevSince)
+	// The fetch must reach back at least to the prune horizon so the
+	// last-visit checks below have the episodes they need.
+	fetchSince := prevSince
+	if pruneCutoff.Before(fetchSince) {
+		fetchSince = pruneCutoff
+	}
+
+	fixes, err := d.GetPositionsForDwell(trackerID, fetchSince)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// Gate and split into current and previous window.
-	var cur, prev []DwellPosition
+	// Gate and split into current and previous window. gated keeps the
+	// whole fetched range for prune last-visit checks; fixes older than
+	// the trend window are excluded from prev so prev_share keeps its
+	// semantics.
+	var gated, cur, prev []DwellPosition
 	for _, p := range fixes {
 		if !dwellGate(p) {
+			continue
+		}
+		gated = append(gated, p)
+		if p.Timestamp.Before(prevSince) {
 			continue
 		}
 		if p.Timestamp.Before(since) {
@@ -275,9 +302,8 @@ func (d *Database) computeWaypoints(trackerID, days int, loc *time.Location) ([]
 	waypoints := make([]Waypoint, 0, len(order))
 	wpIndexByLabel := make(map[int]int, len(order))
 
-	for rank, r := range order {
+	for _, r := range order {
 		c := r.c
-		wpIndexByLabel[r.label] = rank
 		var match *WaypointRecord
 		best := dwellMatchRadiusM
 		for i := range stored {
@@ -289,10 +315,28 @@ func (d *Database) computeWaypoints(trackerID, days int, loc *time.Location) ([]
 				match = &stored[i]
 			}
 		}
-
-		var wp Waypoint
 		if match != nil {
 			claimed[match.ID] = true
+		}
+
+		// Prune places not visited within the prune horizon: delete the
+		// stored row (name included) and drop the cluster from the
+		// response. A genuinely revisited place is re-detected as a fresh
+		// waypoint.
+		if c.lastVisit.Before(pruneCutoff) {
+			if match != nil {
+				slog.Debug("pruning unvisited waypoint", "id", match.ID, "tracker_id", trackerID, "last_visit", c.lastVisit)
+				if err := d.DeleteWaypoint(match.ID); err != nil {
+					return nil, nil, err
+				}
+			}
+			continue
+		}
+
+		rank := len(waypoints)
+		wpIndexByLabel[r.label] = rank
+		var wp Waypoint
+		if match != nil {
 			if err := d.UpdateWaypointLocation(match.ID, c.lat, c.lon); err != nil {
 				return nil, nil, err
 			}
@@ -324,6 +368,29 @@ func (d *Database) computeWaypoints(trackerID, days int, loc *time.Location) ([]
 		wp.LastVisit = c.lastVisit
 
 		waypoints = append(waypoints, wp)
+	}
+
+	// Prune stored waypoints no cluster claimed and with no dwell episode
+	// near them inside the prune horizon — covers analysis windows shorter
+	// than the horizon, where a stale place produces no cluster at all.
+	pruneEpisodes := detectDwellEpisodes(gated)
+	for i := range stored {
+		if claimed[stored[i].ID] {
+			continue
+		}
+		var lastVisit time.Time
+		for _, ep := range pruneEpisodes {
+			if ep.end.After(lastVisit) &&
+				haversineDistance(stored[i].Latitude, stored[i].Longitude, ep.lat, ep.lon) <= dwellMatchRadiusM {
+				lastVisit = ep.end
+			}
+		}
+		if lastVisit.Before(pruneCutoff) {
+			slog.Debug("pruning unvisited waypoint", "id", stored[i].ID, "tracker_id", trackerID, "last_visit", lastVisit)
+			if err := d.DeleteWaypoint(stored[i].ID); err != nil {
+				return nil, nil, err
+			}
+		}
 	}
 
 	// Dwell in the previous window, attributed to the nearest current
