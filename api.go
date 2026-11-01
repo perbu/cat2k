@@ -239,6 +239,15 @@ func (a *APIServer) unsubscribe(ch chan struct{}) {
 	a.sseMu.Unlock()
 }
 
+// ActiveViewers returns how many browsers currently have the web UI open, as
+// counted by live /api/events SSE connections. Used by the scheduler to decide
+// whether to sync on the tighter active-viewer cadence.
+func (a *APIServer) ActiveViewers() int {
+	a.sseMu.Lock()
+	defer a.sseMu.Unlock()
+	return len(a.sseClients)
+}
+
 // NotifyUpdate signals every connected SSE client that new data is available.
 // Slow clients (buffer already full) are skipped — the next event or heartbeat
 // will catch them up. Safe to call from any goroutine (e.g. the scheduler).

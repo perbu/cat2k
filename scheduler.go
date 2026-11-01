@@ -22,6 +22,17 @@ type Scheduler struct {
 	// disables the poller.
 	stateInterval time.Duration
 
+	// activeSyncInterval is how often to sync while viewerCount reports at
+	// least one connected browser, tighter than the idle cron schedule so the
+	// web UI stays fresh while someone is actually watching. Zero (or a nil
+	// viewerCount) disables this and leaves syncing to the cron alone.
+	activeSyncInterval time.Duration
+
+	// viewerCount, if set, reports how many browsers currently have the web
+	// UI open (live /api/events SSE connections). Set by main.go to the
+	// APIServer's count once the HTTP server exists.
+	viewerCount func() int
+
 	// onSyncComplete, if set, is called after each successful sync. Used to
 	// push live updates to connected web clients.
 	onSyncComplete func()
@@ -33,13 +44,14 @@ type Scheduler struct {
 }
 
 // newScheduler creates a new scheduler
-func newScheduler(schedule string, stateInterval time.Duration, worker *SyncWorker, logger *slog.Logger) *Scheduler {
+func newScheduler(schedule string, stateInterval, activeSyncInterval time.Duration, worker *SyncWorker, logger *slog.Logger) *Scheduler {
 	return &Scheduler{
-		schedule:      schedule,
-		stateInterval: stateInterval,
-		worker:        worker,
-		logger:        logger,
-		cron:          cron.New(),
+		schedule:           schedule,
+		stateInterval:      stateInterval,
+		activeSyncInterval: activeSyncInterval,
+		worker:             worker,
+		logger:             logger,
+		cron:               cron.New(),
 	}
 }
 
@@ -79,30 +91,58 @@ func (s *Scheduler) runStatePoller(ctx context.Context) {
 	}
 }
 
+// runSync triggers a sync via TrySyncAll, logging the outcome under the given
+// reason ("scheduled" or "active") and firing onSyncComplete on success.
+// Shared by the cron job and the active-sync ticker so both report and notify
+// identically.
+func (s *Scheduler) runSync(reason string) {
+	s.logger.Info(reason + " sync triggered")
+
+	syncCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
+	err := s.worker.TrySyncAll(syncCtx)
+	switch {
+	case errors.Is(err, ErrSyncInProgress):
+		s.logger.Info(reason + " sync skipped: a sync is already running")
+	case err != nil:
+		s.logger.Error(reason+" sync failed", "error", err)
+	default:
+		s.logger.Info(reason + " sync completed successfully")
+		if s.onSyncComplete != nil {
+			s.onSyncComplete()
+		}
+	}
+}
+
+// runActiveSyncer syncs on activeSyncInterval for as long as viewerCount
+// reports at least one connected browser, until the context is cancelled. It
+// is a plain ticker, not a cron: the idle cron job already covers the
+// no-viewer case, so this only needs to add extra syncs while someone is
+// watching.
+func (s *Scheduler) runActiveSyncer(ctx context.Context) {
+	ticker := time.NewTicker(s.activeSyncInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if s.viewerCount() > 0 {
+				s.runSync("active")
+			}
+		}
+	}
+}
+
 // Run starts the scheduler and blocks until context is cancelled
 func (s *Scheduler) Run(ctx context.Context) error {
 	s.logger.Info("Setting up scheduler", "schedule", s.schedule)
 
 	// Add sync job to cron
 	_, err := s.cron.AddFunc(s.schedule, func() {
-		s.logger.Info("Scheduled sync triggered")
-
-		// Create context with timeout for sync operation
-		syncCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-		defer cancel()
-
-		err := s.worker.TrySyncAll(syncCtx)
-		switch {
-		case errors.Is(err, ErrSyncInProgress):
-			s.logger.Info("Scheduled sync skipped: a sync is already running")
-		case err != nil:
-			s.logger.Error("Scheduled sync failed", "error", err)
-		default:
-			s.logger.Info("Scheduled sync completed successfully")
-			if s.onSyncComplete != nil {
-				s.onSyncComplete()
-			}
-		}
+		s.runSync("scheduled")
 	})
 	if err != nil {
 		return err
@@ -116,6 +156,12 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	if s.stateInterval > 0 {
 		s.logger.Info("Starting tracker state poller", "interval", s.stateInterval)
 		go s.runStatePoller(ctx)
+	}
+
+	// Sync more often while someone has the web UI open, alongside the cron.
+	if s.activeSyncInterval > 0 && s.viewerCount != nil {
+		s.logger.Info("Starting active-viewer syncer", "interval", s.activeSyncInterval)
+		go s.runActiveSyncer(ctx)
 	}
 
 	// Wait for context cancellation

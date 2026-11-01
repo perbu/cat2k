@@ -48,7 +48,8 @@ Optional configuration:
 - `home_lat`, `home_lon` - Home coordinates for radar center point
 - `surehub_email`, `surehub_password` - SureHub credentials for pet flap status
 - `pois` - Array of points of interest `[{"name": "Place", "lat": 59.0, "lon": 10.0, "color": "#fff"}]`
-- `sync_schedule` - Cron expression (code default: `0 2 * * *` nightly at 2am; `config.example.json` ships `*/5 * * * *`)
+- `sync_schedule` - Cron expression for the idle baseline sync cadence, used whenever nobody has the web UI open (code default: `0 * * * *`, hourly)
+- `active_sync_interval_s` - How often (seconds, default 300) to sync while at least one browser has the web UI open (a live `/api/events` SSE connection); 0 disables this and leaves syncing to `sync_schedule` alone regardless of viewers (see scheduler.go)
 - `tracker_state_interval_s` - How often (seconds, default 60) to poll collar on/off state; 0 disables the poller (see power.go)
 - `http_listen` - HTTP server listen address (default: `:8080`, e.g., `127.0.0.1:8080` for localhost only)
 
@@ -156,9 +157,11 @@ Trapped-cat / out-of-territory alerting (issue #7) — a transparent heuristic o
 - Phone-push delivery (ntfy/webhook) is deliberately NOT implemented — follow-up per the issue
 
 ### scheduler.go
-Cron-based scheduling using github.com/robfig/cron/v3. Runs sync jobs on configured schedule with graceful shutdown support.
+Cron-based scheduling using github.com/robfig/cron/v3. Runs sync jobs on the configured idle-baseline schedule (`sync_schedule`, default hourly) with graceful shutdown support.
 
-Alongside the cron it runs the collar state poller (`runStatePoller`, `tracker_state_interval_s`, default 60s, immediate first poll so a fresh daemon is not `unknown` for a whole interval). It is deliberately separate from the sync cron: whether a tracker is switched on is a question about now, and the cron is coarse (nightly by default). A state change fires `onStateChange` — wired to `APIServer.NotifyUpdate` — so browsers learn a collar came off without waiting for the next position sync.
+Alongside the cron it runs the collar state poller (`runStatePoller`, `tracker_state_interval_s`, default 60s, immediate first poll so a fresh daemon is not `unknown` for a whole interval). It is deliberately separate from the sync cron: whether a tracker is switched on is a question about now, and the cron is coarse (hourly by default). A state change fires `onStateChange` — wired to `APIServer.NotifyUpdate` — so browsers learn a collar came off without waiting for the next position sync.
+
+It also runs an active-viewer syncer (`runActiveSyncer`, `active_sync_interval_s`, default 300s) on its own ticker alongside the cron: whenever `viewerCount` (wired to `APIServer.ActiveViewers`, a count of live `/api/events` SSE connections) reports at least one open web UI tab, each tick triggers an extra sync via the same `runSync` helper the cron job uses — so the page stays fresh (default every 5 min) while someone is watching, without syncing that often when nobody is. `viewerCount == nil` or `active_sync_interval_s == 0` disables the ticker entirely, falling back to the idle cron cadence.
 
 ### ratelimit.go
 Token bucket rate limiter to respect API limits (default: 4 req/sec).

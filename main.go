@@ -112,7 +112,7 @@ func runDaemon(cfg *Config) error {
 	worker := newSyncWorker(cfg, db, logger)
 
 	// Create scheduler
-	scheduler := newScheduler(cfg.SyncSchedule, cfg.TrackerStateInterval(), worker, logger)
+	scheduler := newScheduler(cfg.SyncSchedule, cfg.TrackerStateInterval(), cfg.ActiveSyncInterval(), worker, logger)
 
 	// Setup signal handling for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
@@ -132,6 +132,7 @@ func runDaemon(cfg *Config) error {
 		// and whenever a collar switches on or off.
 		scheduler.onSyncComplete = apiServer.NotifyUpdate
 		scheduler.onStateChange = apiServer.NotifyUpdate
+		scheduler.viewerCount = apiServer.ActiveViewers
 
 		go func() {
 			if err := apiServer.Start(); err != nil {
@@ -148,6 +149,7 @@ func runDaemon(cfg *Config) error {
 
 	logger.Info("Daemon started",
 		"schedule", cfg.SyncSchedule,
+		"active_sync_interval", cfg.ActiveSyncInterval(),
 		"tracker_state_interval", cfg.TrackerStateInterval(),
 		"http_enabled", cfg.HTTPEnabled,
 		"http_listen", cfg.HTTPListen)

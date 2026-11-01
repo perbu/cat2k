@@ -22,8 +22,16 @@ type Config struct {
 	// Backfill configuration
 	BackfillStartDate string `json:"backfill_start_date"` // YYYY-MM-DD format
 
-	// Sync schedule (cron format or "nightly")
+	// Sync schedule (cron format) - the idle baseline cadence, used whenever
+	// nobody has the web UI open. Code default is hourly.
 	SyncSchedule string `json:"sync_schedule"`
+
+	// ActiveSyncIntervalS is how often, in seconds, to sync while at least one
+	// browser has the web UI open (an /api/events SSE connection is live) -
+	// tighter than the idle SyncSchedule so the page stays fresh while someone
+	// is actually watching. Zero disables this and leaves syncing to
+	// SyncSchedule alone regardless of viewers.
+	ActiveSyncIntervalS int `json:"active_sync_interval_s"`
 
 	// TrackerStateIntervalS is how often, in seconds, the collars' on/off
 	// state is polled from Weenect's tracker endpoint (power.go). It runs
@@ -82,6 +90,15 @@ func (c *Config) TrackerStateInterval() time.Duration {
 	return time.Duration(c.TrackerStateIntervalS) * time.Second
 }
 
+// ActiveSyncInterval returns the sync interval used while the web UI has a
+// viewer connected, or zero when that behavior is disabled.
+func (c *Config) ActiveSyncInterval() time.Duration {
+	if c.ActiveSyncIntervalS <= 0 {
+		return 0
+	}
+	return time.Duration(c.ActiveSyncIntervalS) * time.Second
+}
+
 // POI represents a point of interest on the radar
 type POI struct {
 	Name  string  `json:"name"`
@@ -96,7 +113,8 @@ func DefaultConfig() *Config {
 		DatabasePath:          "./catboard.db",
 		RateLimit:             4.0,                                                // 4 requests per second
 		BackfillStartDate:     time.Now().AddDate(0, 0, -30).Format("2006-01-02"), // Last 30 days
-		SyncSchedule:          "0 2 * * *",                                        // 2am daily (cron format)
+		SyncSchedule:          "0 * * * *",                                        // hourly idle baseline (cron format)
+		ActiveSyncIntervalS:   300,                                                // every 5 min while the web UI is open
 		TrackerStateIntervalS: 60,                                                 // poll collar on/off state every minute
 		LogLevel:              "info",
 		HTTPListen:            ":8080",
@@ -168,6 +186,12 @@ func loadConfig(configPath string) (*Config, error) {
 	}
 	if val := os.Getenv("WEENECT_SYNC_SCHEDULE"); val != "" {
 		cfg.SyncSchedule = val
+	}
+	if val := os.Getenv("WEENECT_ACTIVE_SYNC_INTERVAL_S"); val != "" {
+		var interval int
+		if _, err := fmt.Sscanf(val, "%d", &interval); err == nil {
+			cfg.ActiveSyncIntervalS = interval
+		}
 	}
 	if val := os.Getenv("WEENECT_TRACKER_STATE_INTERVAL_S"); val != "" {
 		var interval int
