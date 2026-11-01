@@ -40,9 +40,17 @@ func (w *SyncWorker) TrySyncAll(ctx context.Context) error {
 	return w.SyncAll(ctx)
 }
 
+// weenectUserAgent mimics the iOS app's CFNetwork-generated User-Agent
+// instead of the default "weenect-go/1.0.0", which identifies this as a
+// third-party client. Tried as a fix for GET /mytracker hanging past TLS
+// handshake until client timeout; ruled out (same failures persisted after
+// switching), root cause turned out to be call frequency on that endpoint
+// (see tracker_state_interval_s). Left in place since there's no downside.
+const weenectUserAgent = "Weenect/12 CFNetwork/1498.700.2 Darwin/23.6.0"
+
 // newSyncWorker creates a new sync worker
 func newSyncWorker(cfg *Config, db *Database, logger *slog.Logger) *SyncWorker {
-	client := weenect.NewClient(cfg.Username, cfg.Password)
+	client := weenect.NewClient(cfg.Username, cfg.Password, weenect.WithUserAgent(weenectUserAgent))
 	rateLimiter := newRateLimiter(cfg.RateLimit, logger)
 
 	return &SyncWorker{
