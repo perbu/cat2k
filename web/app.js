@@ -8,7 +8,13 @@ const HEATMAP_PALETTES = [
     // Cool: deep blue → cyan-blue → mint-cyan → pale cyan
     { 0.0: '#0040c0', 0.4: '#00b4ff', 0.7: '#40ffc0', 1.0: '#e0ffff' },
     // Warm: dark red → orange-red → orange → yellow (mirrors classic heat gradient)
-    { 0.0: '#c01818', 0.4: '#ff4818', 0.7: '#ffa020', 1.0: '#ffe830' }
+    { 0.0: '#c01818', 0.4: '#ff4818', 0.7: '#ffa020', 1.0: '#ffe830' },
+    // Violet: deep purple → violet → orchid → pale lilac
+    { 0.0: '#4c1d95', 0.4: '#9333ea', 0.7: '#d946ef', 1.0: '#fae8ff' },
+    // Green: forest → green → lime → pale lime
+    { 0.0: '#0b5d2e', 0.4: '#16a34a', 0.7: '#a3e635', 1.0: '#f7fee7' },
+    // Pink: crimson-rose → hot pink → light pink → blush
+    { 0.0: '#9d174d', 0.4: '#ec4899', 0.7: '#f9a8d4', 1.0: '#fff1f7' }
 ];
 
 // The trail shows everything since 06:00 local this morning — the cat's day
@@ -27,12 +33,16 @@ const HOUR_DOT_TOLERANCE_MIN = 15;
 const DEFAULT_ZOOM = 17;
 
 // Per-cat accent colours (DESIGN.md). Indexed in the same id-sorted order as
-// the heatmap palettes, so cat #0 (Bella) is green and cat #1 (Luna) is orange.
+// the heatmap palettes, so cat #0 (Bella) is green and cat #1 (Luna) is orange; cats #2-#4
+// get violet, sky blue and pink. Wraps around past five.
 // Used ONLY in the control panel — the cat's own dot + activity chart. The map
 // keeps its blue/red heatmap palettes (see HEATMAP_PALETTES above).
 const CAT_ACCENTS = [
     { color: '#17BE7E', muted: '#BEEBD6' }, // Bella
-    { color: '#F5991F', muted: '#FBDDB4' }  // Luna
+    { color: '#F5991F', muted: '#FBDDB4' }, // Luna
+    { color: '#8B5CF6', muted: '#DDD6FE' }, // violet
+    { color: '#1E9BE0', muted: '#BDE3F7' }, // sky blue
+    { color: '#E8489B', muted: '#F8C8E0' }  // pink
 ];
 
 function accentForIndex(idx) {

@@ -38,6 +38,9 @@ charts) and clutter (raw heat-map sliders exposed). The redesign:
 | Page canvas (behind panel) | `#E7EBEA` |
 | **Bella** (accent) | `#17BE7E` — chart bars muted `#BEEBD6`, halo `rgba(23,190,126,0.16)` |
 | **Luna** (accent) | `#F5991F` — chart bars muted `#FBDDB4`, halo `rgba(245,153,31,0.16)` |
+| **Cat 3** (accent) | `#8B5CF6` violet — chart bars muted `#DDD6FE` |
+| **Cat 4** (accent) | `#1E9BE0` sky blue — chart bars muted `#BDE3F7` |
+| **Cat 5** (accent) | `#E8489B` pink — chart bars muted `#F8C8E0` |
 | Battery fill (normal) | `#7A828C`; shell border `#A8AEB6` |
 | Battery low (<20%) | `#E08A00` (fill + text) — *rule, not yet triggered in mock* |
 
@@ -75,7 +78,7 @@ Full-width ink button (40px, radius 11) with refresh glyph + label. Caption row 
 Segmented control: track `#F0F2F4`, 3px padding. Active segment = white fill + subtle
 shadow + ink text; inactive = secondary text. Options: `7d / 30d / 90d / Custom`.
 
-### Cat card (repeated per cat — always exactly 2: Bella, Luna)
+### Cat card (repeated per cat — one per tracker, accents assigned in id-sorted order)
 ```
 [● name]                    [battery pill  84%]
 Last seen 2 min ago · nr. Lillevann
