@@ -69,6 +69,7 @@ let heatMapSettings = {
 let waypointsByTracker = {};   // trackerId -> waypoints[] from /api/waypoints
 let transitionsByTracker = {}; // trackerId -> edges[] from /api/waypoints/transitions
 let waypointMarkers = {};      // trackerId -> L.layerGroup of waypoint markers
+let waypointMarkerById = {};   // waypoint id -> L.circleMarker (while shown)
 let routeLayers = {};          // trackerId -> L.layerGroup of transition edges
 let waypointSettings = {
     places: false,             // waypoint markers on the map (busy — opt-in)
@@ -84,21 +85,6 @@ let rangeSettings = {
 let overlapSeries = [];        // /api/range/overlap response
 let presenceByTracker = {};    // trackerId -> /api/presence response
 let excursionsByTracker = {};  // trackerId -> /api/presence/excursions .stats
-let behaviorSegByTracker = {};   // trackerId -> /api/behavior/segments response
-let behaviorBudgetByTracker = {}; // trackerId -> /api/behavior/budget response
-let behaviorMatrixByTracker = {}; // trackerId -> /api/behavior/matrix response
-let behaviorLayers = {};         // trackerId -> L.layerGroup of state-colored steps
-let behaviorSettings = {
-    tracks: false                // color tracks by rest/forage/transit state
-};
-let proximityData = null;        // /api/proximity response for the selected day
-let shiftData = null;            // /api/proximity/shifts response
-let leadFollowData = null;       // /api/proximity/leadfollow response
-let togetherLayer = null;        // L.layerGroup of together-episode segments
-let proximitySettings = {
-    overlay: false,              // together-episode paired segments on the map
-    date: null                   // YYYY-MM-DD, initialized to today
-};
 
 function paletteForIndex(idx) {
     return HEATMAP_PALETTES[idx % HEATMAP_PALETTES.length];
@@ -825,6 +811,7 @@ function waypointPopupHtml(wp) {
 // tracks the transition probability.
 function renderWaypointLayer(id) {
     if (waypointMarkers[id]) { map.removeLayer(waypointMarkers[id]); delete waypointMarkers[id]; }
+    (waypointsByTracker[id] || []).forEach(wp => { delete waypointMarkerById[wp.id]; });
     if (routeLayers[id]) { map.removeLayer(routeLayers[id]); delete routeLayers[id]; }
     if (!map) return;
 
@@ -835,7 +822,7 @@ function renderWaypointLayer(id) {
     if (waypointSettings.places) {
         const group = L.layerGroup();
         wps.forEach(wp => {
-            L.circleMarker([wp.lat, wp.lon], {
+            waypointMarkerById[wp.id] = L.circleMarker([wp.lat, wp.lon], {
                 radius: 6 + 14 * Math.sqrt(wp.share || 0),
                 color: '#fff',
                 weight: 2,
@@ -878,9 +865,31 @@ function refreshWaypointLayers() {
     allTrackers.forEach(t => renderWaypointLayer(t.id));
 }
 
-// Sidebar "Top places" panel: per cat, the waypoints ranked by dwell share,
-// with the share change vs. the previous period as a trend arrow. Clicking a
-// row pans the map to the place.
+function setPlacesVisible(on) {
+    waypointSettings.places = on;
+    const toggle = document.getElementById('places-toggle');
+    if (toggle) {
+        toggle.classList.toggle('on', on);
+        toggle.setAttribute('aria-checked', String(on));
+    }
+    refreshWaypointLayers();
+}
+
+// Show one waypoint on the map: the markers are opt-in, so switch them on
+// first (otherwise the map would pan to an empty spot), then center on the
+// place and open its popup.
+function focusWaypoint(wpId) {
+    if (!map) return;
+    if (!waypointSettings.places) setPlacesVisible(true);
+    const marker = waypointMarkerById[wpId];
+    if (!marker) return;
+    map.setView(marker.getLatLng(), Math.max(map.getZoom(), 18));
+    marker.openPopup();
+}
+
+// "Top places" list inside the Waypoints card: per cat, the waypoints ranked
+// by dwell share, with the share change vs. the previous period as a trend
+// arrow. Clicking a row shows the waypoint on the map (see focusWaypoint).
 function renderTopPlaces() {
     const container = document.getElementById('top-places');
     if (!container) return;
@@ -901,7 +910,7 @@ function renderTopPlaces() {
             } else if (delta < -0.02) {
                 trend = `<span class="place-trend trend-down">▼${Math.round(-delta * 100)}</span>`;
             }
-            return `<div class="place-row" data-lat="${wp.lat}" data-lon="${wp.lon}">
+            return `<div class="place-row" data-wp="${wp.id}" title="Show on map">
                 <span class="place-dot" style="background:${accent}"></span>
                 <span class="place-name">${escapeHtml(wp.name)}</span>
                 <span class="place-share mono">${Math.round((wp.share || 0) * 100)}%</span>
@@ -914,13 +923,11 @@ function renderTopPlaces() {
     }).filter(Boolean).join('');
 
     container.innerHTML = sections
-        ? `<div><div class="section-label">Top places · ${currentDays()}d</div></div>${sections}`
+        ? `<div class="section-label">Top places · ${currentDays()}d</div>${sections}`
         : '';
 
     container.querySelectorAll('.place-row').forEach(row => {
-        row.addEventListener('click', () => {
-            if (map) map.setView([+row.dataset.lat, +row.dataset.lon], 18);
-        });
+        row.addEventListener('click', () => focusWaypoint(+row.dataset.wp));
     });
 }
 
@@ -1151,11 +1158,7 @@ function drawOverlapChart() {
 // Right-rail cards follow the global date range (currentDays()), clamped
 // where the visualization stacks one row/column per day.
 const PRESENCE_MAX_DAYS = 14; // one 24h ribbon per day
-const BUDGET_MAX_DAYS = 31;   // one stacked budget column per day
-const SHIFT_MAX_DAYS = 14;    // one patrol-grid row per day
 function presenceDays() { return Math.min(currentDays(), PRESENCE_MAX_DAYS); }
-function budgetDays() { return Math.min(currentDays(), BUDGET_MAX_DAYS); }
-function shiftDays() { return Math.min(currentDays(), SHIFT_MAX_DAYS); }
 
 // Semantic state colors. Ribbons are zone-only (home/away) — the WiFi zone is
 // the single source of truth; the SureHub flap state is known-stale and never
@@ -1311,399 +1314,8 @@ function renderExcursionStats() {
     container.innerHTML = sections || '<div class="panel-empty">No excursions recorded.</div>';
 }
 
-// ----- Behavior: HMM rest/forage/transit segmentation (issue #5) -----
-
-// Semantic state colors, shared by the track layer, budget bars, hour matrix,
-// and the card legend. Order matters: budget columns stack rest at the
-// bottom, transit on top.
-const BEHAVIOR_STATES = ['rest', 'forage', 'transit'];
-const BEHAVIOR_STATE_COLORS = { rest: '#3B82F6', forage: '#F59E0B', transit: '#EF4444' };
-
-// Fetch decoded segments (current date range), the daily budget, and the
-// hour matrix for every tracker, then re-render the layer and both panels.
-// Swallows per-tracker errors — a cat without a fitted model (too little
-// data) just gets no behavior visualizations.
-async function loadBehavior() {
-    if (allTrackers.length === 0) return;
-    const range = getDateRange();
-    const win = new URLSearchParams({ from: range.start.toISOString(), to: range.end.toISOString() });
-
-    await Promise.all(allTrackers.map(async t => {
-        try {
-            const [segRes, budRes, matRes] = await Promise.all([
-                fetch(`${API_BASE}/api/behavior/segments?tracker_id=${t.id}&${win}`)
-                    .then(r => r.ok ? r.json() : null),
-                fetch(`${API_BASE}/api/behavior/budget?tracker_id=${t.id}&days=${budgetDays()}`)
-                    .then(r => r.ok ? r.json() : null),
-                fetch(`${API_BASE}/api/behavior/matrix?tracker_id=${t.id}&days=${currentDays()}`)
-                    .then(r => r.ok ? r.json() : null)
-            ]);
-            behaviorSegByTracker[t.id] = segRes;
-            behaviorBudgetByTracker[t.id] = budRes;
-            behaviorMatrixByTracker[t.id] = matRes;
-            renderBehaviorLayer(t.id);
-        } catch (err) {
-            console.error(`Failed to load behavior for tracker ${t.id}:`, err);
-        }
-    }));
-
-    renderBehaviorBudget();
-    renderBehaviorMatrix();
-}
-
-// Draw one tracker's decoded steps as straight segments colored by state.
-// Straight lines, not splines: each step has its own state, so the segment
-// boundaries must stay exactly on the decoded steps.
-function renderBehaviorLayer(id) {
-    if (behaviorLayers[id]) { map.removeLayer(behaviorLayers[id]); delete behaviorLayers[id]; }
-    if (!map || !behaviorSettings.tracks) return;
-
-    const steps = behaviorSegByTracker[id]?.steps || [];
-    if (steps.length === 0) return;
-
-    const group = L.layerGroup();
-    steps.forEach(s => {
-        L.polyline([s.from, s.to], {
-            color: BEHAVIOR_STATE_COLORS[s.state] || '#9198A2',
-            weight: 3.5,
-            opacity: 0.9,
-            lineCap: 'round'
-        }).addTo(group).bindTooltip(
-            `${s.state} · ${formatDistance(s.step_m)} · ${new Date(s.t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
-        );
-    });
-    group.addTo(map);
-    behaviorLayers[id] = group;
-}
-
-function refreshBehaviorLayers() {
-    allTrackers.forEach(t => renderBehaviorLayer(t.id));
-}
-
-// "Activity budget" panel: per cat, one full-height stacked column per day —
-// the share of decoded time in each state (rest bottom, transit top). The
-// hover title carries absolute hours; empty track means no decoded steps that
-// day (the cat was home on WiFi-zone fixes, or the collar was off).
-function renderBehaviorBudget() {
-    const container = document.getElementById('behavior-budget');
-    if (!container) return;
-
-    const roster = [...allTrackers].sort((a, b) => a.id - b.id);
-    const dayLabel = (date) => new Date(date + 'T00:00:00')
-        .toLocaleDateString(undefined, { weekday: 'short' });
-
-    const sections = roster.map(t => {
-        const days = behaviorBudgetByTracker[t.id]?.budget || [];
-        if (days.length === 0) return '';
-        const accent = accentForIndex(trackerPaletteIndex(t.id)).color;
-
-        const cols = days.map((d, i) => {
-            const total = d.rest_s + d.forage_s + d.transit_s;
-            const title = total > 0
-                ? `${d.date} — rest ${formatDurationS(d.rest_s)} · forage ${formatDurationS(d.forage_s)} · transit ${formatDurationS(d.transit_s)}`
-                : `${d.date} — no decoded steps`;
-            const segs = total > 0
-                ? BEHAVIOR_STATES.map(s =>
-                    `<div style="height:${d[s + '_s'] / total * 100}%;background:${BEHAVIOR_STATE_COLORS[s]}"></div>`
-                ).join('')
-                : '';
-            return `<div class="bh-col" title="${title}">${segs}</div>`;
-        }).join('');
-
-        // Weekday per column for short windows; past ~10 columns the labels
-        // would collide, so thin to a stride and switch to short dates.
-        const n = days.length;
-        const stride = n <= 10 ? 1 : Math.ceil(n / 8);
-        const labels = days.map((d, i) => {
-            const isToday = i === n - 1;
-            if (isToday) return '<span class="today">Today</span>';
-            if (i % stride !== 0) return '<span></span>';
-            const text = n <= 10 ? dayLabel(d.date) : new Date(d.date + 'T00:00:00')
-                .toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
-            return `<span>${text}</span>`;
-        }).join('');
-
-        return `<div class="bh-cat">
-            <div class="bh-cat-head">
-                <span class="cat-dot" style="background:${accent}"></span>
-                <span class="bh-cat-name">${escapeHtml(t.name)}</span>
-            </div>
-            <div class="bh-cols">${cols}</div>
-            <div class="bh-collabels">${labels}</div>
-        </div>`;
-    }).filter(Boolean).join('');
-
-    container.innerHTML = sections
-        ? `<div class="bh-sub">Activity budget · ${budgetDays()}d</div>${sections}`
-        : '<div class="panel-empty">No behavior model yet — needs more GPS history.</div>';
-}
-
-// "State by hour" panel: per cat, 24 stacked micro-bars (one per hour of
-// day) showing the state share within that hour over the current date
-// range — the crepuscular rhythm view.
-function renderBehaviorMatrix() {
-    const container = document.getElementById('behavior-matrix');
-    if (!container) return;
-
-    const roster = [...allTrackers].sort((a, b) => a.id - b.id);
-
-    const sections = roster.map(t => {
-        const resp = behaviorMatrixByTracker[t.id];
-        if (!resp || !resp.model_ready) return '';
-        const matrix = resp.matrix || [];
-        const accent = accentForIndex(trackerPaletteIndex(t.id)).color;
-
-        const rows = matrix.map((shares, h) => {
-            const total = (shares || []).reduce((a, b) => a + b, 0);
-            const segs = total > 0
-                ? BEHAVIOR_STATES.map((s, i) =>
-                    `<div style="width:${shares[i] * 100}%;background:${BEHAVIOR_STATE_COLORS[s]}" title="${h}:00 — ${s} ${Math.round(shares[i] * 100)}%"></div>`
-                ).join('')
-                : '';
-            const label = h % 6 === 0 ? String(h) : '';
-            return `<div class="bh-hrow"><span class="bh-hr mono">${label}</span><div class="bh-hbar">${segs}</div></div>`;
-        }).join('');
-
-        return `<div class="bh-cat">
-            <div class="bh-cat-head">
-                <span class="cat-dot" style="background:${accent}"></span>
-                <span class="bh-cat-name">${escapeHtml(t.name)}</span>
-            </div>
-            <div class="bh-matrix">${rows}</div>
-        </div>`;
-    }).filter(Boolean).join('');
-
-    container.innerHTML = sections
-        ? `<div class="bh-sub">State by hour · ${currentDays()}d</div>${sections}`
-        : '';
-}
-
-// ----- Inter-cat proximity: distance series, together episodes, shifts, lead/follow (issue #6) -----
-
-// Local YYYY-MM-DD for the date input (toISOString would give UTC).
-function localDateStr(d) {
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-}
-
-// Fetch the proximity trio — distance series + together episodes for the
-// selected day, the patrol-shift grid, and the lead/follow stats — then
-// re-render the chart, map overlay, and panels. Swallows errors; stale
-// panels stay as they are.
-async function loadProximity() {
-    setText('shifts-sub', `Who was out, hour by hour · ${shiftDays()}d`);
-    setText('leadfollow-sub', `Does one cat trail the other out? · ${currentDays()}d`);
-    if (allTrackers.length < 2) return;
-    const date = proximitySettings.date || localDateStr(new Date());
-    try {
-        const [pRes, sRes, lRes] = await Promise.all([
-            fetch(`${API_BASE}/api/proximity?date=${date}`).then(r => r.ok ? r.json() : null),
-            fetch(`${API_BASE}/api/proximity/shifts?days=${shiftDays()}`).then(r => r.ok ? r.json() : null),
-            fetch(`${API_BASE}/api/proximity/leadfollow?days=${currentDays()}`).then(r => r.ok ? r.json() : null)
-        ]);
-        proximityData = pRes;
-        shiftData = sRes;
-        leadFollowData = lRes;
-    } catch (err) {
-        console.error('Failed to load proximity data:', err);
-    }
-    drawProximityChart();
-    renderTogetherLayer();
-    renderShiftGrid();
-    renderLeadFollow();
-}
-
-// Distance-over-time chart for the selected day: log-scale y (1 m–1 km; the
-// interesting range is 0–100 m), together episodes shaded behind the line,
-// coverage gaps breaking the line, and a dashed rule at the together
-// threshold.
-function drawProximityChart() {
-    const canvas = document.getElementById('proximity-chart');
-    if (!canvas) return;
-    const empty = document.getElementById('proximity-empty');
-
-    const dpr = window.devicePixelRatio || 1;
-    const w = canvas.clientWidth, h = canvas.clientHeight;
-    canvas.width = w * dpr;
-    canvas.height = h * dpr;
-    const ctx = canvas.getContext('2d');
-    ctx.scale(dpr, dpr);
-    ctx.clearRect(0, 0, w, h);
-
-    const data = proximityData;
-    const series = data?.series || [];
-    if (empty) empty.style.display = series.length ? 'none' : 'block';
-    if (!data || series.length === 0 || w === 0) return;
-
-    const from = new Date(data.from).getTime();
-    const to = new Date(data.to).getTime();
-    const xms = (ms) => (ms - from) / (to - from) * w;
-    const x = (t) => xms(new Date(t).getTime());
-
-    // Log10 scale clamped to [1 m, 1 km], 4px padding top and bottom.
-    const y = (m) => {
-        const v = Math.min(3, Math.max(0, Math.log10(Math.max(1, m))));
-        return h - 4 - (v / 3) * (h - 8);
-    };
-
-    // Together episodes shaded behind everything else.
-    ctx.fillStyle = 'rgba(22,24,29,0.08)';
-    (data.episodes || []).forEach(ep => {
-        const x0 = x(ep.start), x1 = Math.max(x(ep.end), x0 + 2);
-        ctx.fillRect(x0, 0, x1 - x0, h);
-    });
-
-    // Grid lines + labels (right edge) at 1 m / 10 m / 100 m / 1 km.
-    ctx.font = '9px "JetBrains Mono", monospace';
-    ['1m', '10m', '100m', '1km'].forEach((label, i) => {
-        const gy = y(Math.pow(10, i));
-        ctx.strokeStyle = '#EEF0F2';
-        ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(w, gy); ctx.stroke();
-        ctx.fillStyle = '#B4BAC2';
-        ctx.textAlign = 'right';
-        ctx.fillText(label, w - 2, gy - 2);
-    });
-
-    // Together threshold, dashed.
-    ctx.strokeStyle = '#B4BAC2';
-    ctx.setLineDash([3, 3]);
-    ctx.beginPath();
-    ctx.moveTo(0, y(data.together_threshold_m || 20));
-    ctx.lineTo(w, y(data.together_threshold_m || 20));
-    ctx.stroke();
-    ctx.setLineDash([]);
-
-    // Distance line, breaking across coverage gaps (> 2 grid steps).
-    const stepMs = (data.grid_step_s || 60) * 1000;
-    ctx.strokeStyle = '#16181D';
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    let pen = false;
-    let prevT = 0;
-    series.forEach(p => {
-        const t = new Date(p.t).getTime();
-        if (!pen || t - prevT > 2 * stepMs) {
-            ctx.moveTo(xms(t), y(p.distance_m));
-        } else {
-            ctx.lineTo(xms(t), y(p.distance_m));
-        }
-        pen = true;
-        prevT = t;
-    });
-    ctx.stroke();
-
-    // Hour ticks.
-    ctx.fillStyle = '#9198A2';
-    for (let hh = 0; hh <= 24; hh += 6) {
-        ctx.textAlign = hh === 0 ? 'left' : hh === 24 ? 'right' : 'center';
-        ctx.fillText(String(hh), xms(from + hh * 3600000), h - 1);
-    }
-}
-
-// Draw the together episodes as paired trajectory segments, one polyline per
-// cat in its accent color. Straight segments: the points are interpolated
-// grid positions, so corners carry no extra meaning.
-function renderTogetherLayer() {
-    if (togetherLayer) { map.removeLayer(togetherLayer); togetherLayer = null; }
-    if (!map || !proximitySettings.overlay) return;
-
-    const eps = proximityData?.episodes || [];
-    // The server's proximity pair is the first two trackers in roster
-    // (name) order — the same order /api/trackers returned.
-    const cats = allTrackers.slice(0, 2);
-    if (eps.length === 0 || cats.length < 2) return;
-
-    const colorA = accentForIndex(trackerPaletteIndex(cats[0].id)).color;
-    const colorB = accentForIndex(trackerPaletteIndex(cats[1].id)).color;
-    const timeOpt = { hour: '2-digit', minute: '2-digit' };
-
-    const group = L.layerGroup();
-    eps.forEach(ep => {
-        const tip = `together ${new Date(ep.start).toLocaleTimeString([], timeOpt)}`
-            + ` – ${new Date(ep.end).toLocaleTimeString([], timeOpt)} · ${formatDurationS(ep.duration_s)}`;
-        if (ep.points_a?.length > 1) {
-            L.polyline(ep.points_a, { color: colorA, weight: 5, opacity: 0.85, lineCap: 'round' })
-                .addTo(group).bindTooltip(tip);
-        }
-        if (ep.points_b?.length > 1) {
-            L.polyline(ep.points_b, { color: colorB, weight: 5, opacity: 0.85, lineCap: 'round' })
-                .addTo(group).bindTooltip(tip);
-        }
-    });
-    if (group.getLayers().length === 0) return;
-    group.addTo(map);
-    togetherLayer = group;
-}
-
-// Patrol-shift grid: one row per day (oldest first, today last), 24 hourly
-// cells colored by who was out, from the WiFi-zone presence intervals.
-function renderShiftGrid() {
-    const container = document.getElementById('shift-grid');
-    const legend = document.getElementById('shift-legend');
-    if (!container) return;
-
-    const grid = shiftData?.grid || [];
-    const cats = shiftData?.cats || [];
-    if (grid.length === 0 || cats.length < 2) {
-        container.innerHTML = '<div class="panel-empty">Needs two cats with WiFi-zone data.</div>';
-        if (legend) legend.innerHTML = '';
-        return;
-    }
-
-    const nameA = escapeHtml(cats[0].name), nameB = escapeHtml(cats[1].name);
-    const colorA = accentForIndex(trackerPaletteIndex(cats[0].id)).color;
-    const colorB = accentForIndex(trackerPaletteIndex(cats[1].id)).color;
-    const cellColor = { a: colorA, b: colorB, both: '#16181D', neither: '#DFE3E7', nodata: '#FFFFFF' };
-    const cellLabel = {
-        a: `${nameA} out`, b: `${nameB} out`, both: 'both out',
-        neither: 'both home', nodata: 'no data'
-    };
-
-    const rows = grid.map((d, i) => {
-        const isToday = i === grid.length - 1;
-        const label = isToday ? 'Today'
-            : new Date(d.date + 'T00:00:00').toLocaleDateString(undefined, { weekday: 'short' });
-        const cells = (d.hours || []).map((state, hh) =>
-            `<div class="shift-cell${state === 'nodata' ? ' nodata' : ''}" style="background:${cellColor[state] || cellColor.nodata}" title="${d.date} ${hh}:00 — ${cellLabel[state] || state}"></div>`
-        ).join('');
-        return `<div class="shift-row${isToday ? ' today' : ''}">
-            <span class="shift-day">${label}</span>
-            <div class="shift-cells">${cells}</div>
-        </div>`;
-    }).join('');
-
-    container.innerHTML = rows
-        + '<div class="presence-ticks"><span>0</span><span>6</span><span>12</span><span>18</span><span>24</span></div>';
-
-    if (legend) {
-        legend.innerHTML = `
-            <span><span class="legend-swatch" style="background:${colorA}"></span>${nameA} out</span>
-            <span><span class="legend-swatch" style="background:${colorB}"></span>${nameB} out</span>
-            <span><span class="legend-swatch" style="background:#16181D"></span>Both out</span>
-            <span><span class="legend-swatch" style="background:#DFE3E7"></span>Both home</span>`;
-    }
-}
-
-// Lead/follow stat card: one line per direction ("B follows A within 10 min
-// in 34% of departures").
-function renderLeadFollow() {
-    const container = document.getElementById('leadfollow-body');
-    if (!container) return;
-
-    const dirs = leadFollowData?.directions || [];
-    if (dirs.length === 0) {
-        container.innerHTML = '<div class="panel-empty">Needs two cats with WiFi-zone data.</div>';
-        return;
-    }
-    const winMin = Math.round((leadFollowData.follow_window_s || 600) / 60);
-    container.innerHTML = dirs.map(d => {
-        if (d.departures === 0) {
-            return `<div class="lf-line"><b>${escapeHtml(d.follower)}</b> hasn't followed <b>${escapeHtml(d.leader)}</b> out — no eligible departures.</div>`;
-        }
-        return `<div class="lf-line"><b>${escapeHtml(d.follower)}</b> follows <b>${escapeHtml(d.leader)}</b> within ${winMin} min in <b class="mono">${Math.round(d.share * 100)}%</b> of departures (${d.followed}/${d.departures}).</div>`;
-    }).join('');
-}
-
-// Derive heat-map settings from the current map zoom and point density, used// when "Auto-tune" is on. Radius/blur are pixel values, so they track zoom;
+// Derive heat-map settings from the current map zoom and point density, used
+// when "Auto-tune" is on. Radius/blur are pixel values, so they track zoom;
 // intensity per point falls as the total point count rises, so dense ranges
 // don't wash out to solid colour. Mutates heatMapSettings and syncs the (view-
 // only) slider UI so the numbers stay honest.
@@ -1839,9 +1451,7 @@ async function loadAllTrackerData() {
         renderCatCards();
         updateMeta();
         loadWaypoints();
-        loadBehavior();
         loadPresence();
-        loadProximity();
 
         setLoading(false);
         applyAutoUIState();
@@ -1951,10 +1561,7 @@ function setupEventListeners() {
     const placesToggle = document.getElementById('places-toggle');
     if (placesToggle) {
         placesToggle.addEventListener('click', () => {
-            waypointSettings.places = !waypointSettings.places;
-            placesToggle.classList.toggle('on', waypointSettings.places);
-            placesToggle.setAttribute('aria-checked', String(waypointSettings.places));
-            refreshWaypointLayers();
+            setPlacesVisible(!waypointSettings.places);
         });
     }
 
@@ -1976,38 +1583,6 @@ function setupEventListeners() {
             rangeToggle.classList.toggle('on', rangeSettings.enabled);
             rangeToggle.setAttribute('aria-checked', String(rangeSettings.enabled));
             refreshRangeLayers();
-        });
-    }
-
-    // Behavior track-coloring toggle: re-render from cached segments, no refetch.
-    const behaviorToggle = document.getElementById('behavior-toggle');
-    if (behaviorToggle) {
-        behaviorToggle.addEventListener('click', () => {
-            behaviorSettings.tracks = !behaviorSettings.tracks;
-            behaviorToggle.classList.toggle('on', behaviorSettings.tracks);
-            behaviorToggle.setAttribute('aria-checked', String(behaviorSettings.tracks));
-            refreshBehaviorLayers();
-        });
-    }
-
-    // Together-episode overlay toggle: re-render from cached data, no refetch.
-    const togetherToggle = document.getElementById('together-toggle');
-    if (togetherToggle) {
-        togetherToggle.addEventListener('click', () => {
-            proximitySettings.overlay = !proximitySettings.overlay;
-            togetherToggle.classList.toggle('on', proximitySettings.overlay);
-            togetherToggle.setAttribute('aria-checked', String(proximitySettings.overlay));
-            renderTogetherLayer();
-        });
-    }
-
-    // Proximity day picker: refetch the distance series + together episodes.
-    const proxDate = document.getElementById('proximity-date');
-    if (proxDate) {
-        proxDate.addEventListener('change', () => {
-            if (!proxDate.value) return;
-            proximitySettings.date = proxDate.value;
-            loadProximity();
         });
     }
 
@@ -2075,8 +1650,6 @@ function initLiveUpdates() {
             loadRanges();
             loadOverlap();
             loadPresence();
-            loadBehavior();
-            loadProximity();
         });
     } catch (err) {
         console.error('Live updates unavailable:', err);
@@ -2111,11 +1684,6 @@ async function init() {
         rangeSettings.month = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
         const monthInput = document.getElementById('range-month');
         if (monthInput) monthInput.value = rangeSettings.month;
-
-        // Default the proximity day picker to today (local).
-        proximitySettings.date = localDateStr(now);
-        const proxDateInput = document.getElementById('proximity-date');
-        if (proxDateInput) proxDateInput.value = proximitySettings.date;
 
         renderCatCards();   // identity/status skeleton before data arrives
         renderRangeCatToggles();

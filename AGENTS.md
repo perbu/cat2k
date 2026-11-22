@@ -210,29 +210,22 @@ every SSE update so the indicator reacts as soon as a collar switches, and the
 cards re-render each minute so the durations stay truthful),
 plus the waypoint layer (markers sized by dwell share, per-cat accent colors,
 click for stats popup with rename), the toggleable transition-graph overlay
-(curved directed edges, width ∝ probability), and a "Top places" sidebar panel
-ranking waypoints by dwell share with a trend vs. the previous period. The
+(curved directed edges, width ∝ probability), and a "Top places" list inside
+the Waypoints card ranking waypoints by dwell share with a trend vs. the
+previous period — clicking a row switches the (opt-in) waypoint markers on,
+centers the map on the place and opens its popup. The
 "Home range" card adds the KDE contour layer (50% core = stronger fill, 95%
 home range = outline, per-cat accent colors and toggles) with a month picker,
 and the "Territory overlap" card charts the monthly overlap index — clicking a
 bar steps the contour layer to that month. The right-rail cards follow the
 global date-range selector (7d/30d/90d/custom): the "At home" card stacks a
 24h presence ribbon per day (home/away/no-data segments, clamped to 14 days),
-the "Excursions" card shows per-cat duration and departure-hour histograms,
-the "Behavior" card (issue #5) toggles state-colored tracks on the map
-(blue rest / amber forage / red transit, straight segments so state
-boundaries stay exact) and shows the per-cat "Activity budget" (stacked
-state-share column per day, clamped to 31 days) and "State by hour" (24
-stacked micro-bars of state share per hour of day). The "Together"
-card (issue #6) charts the inter-cat distance for a selectable day (log
-scale, together episodes shaded, dashed threshold rule) and toggles the
-together-episode overlay (paired segments in both cats' accent colors); the
-"Patrol shifts" card shows the day × hour grid of who was out (per-cat
-accents, ink for both, gray for both home, hollow for no data, clamped to
-14 days); the "Lead / follow" card states both directions of the
-departure-follow share. Three cards keep their own time pickers: the
-month-based "Home range" and "Territory overlap" cards, and the single-day
-"Together" chart.
+and the "Excursions" card shows per-cat duration and departure-hour
+histograms. The month-based "Home range" and "Territory overlap"
+cards keep their own month picker.
+
+The behavior (issue #5), together-episode, patrol-shift and lead/follow
+(issue #6) views were removed from the UI as unused; their API endpoints remain.
 
 ### web/status.html
 Radar-style status page showing:
